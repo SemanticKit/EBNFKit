@@ -6,10 +6,6 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXBuildFile section */
-		8C97E5642F3BE0FE00861414 /* EBNFKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8C97E5582F3BE0FE00861414 /* EBNFKit.framework */; };
-/* End PBXBuildFile section */
-
 /* Begin PBXContainerItemProxy section */
 		8C97E5652F3BE0FE00861414 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -21,8 +17,9 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
-		8C97E5582F3BE0FE00861414 /* EBNFKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = EBNFKit.framework; sourceTree = BUILT_PRODUCTS_DIR; };
-		8C97E5632F3BE0FE00861414 /* EBNFKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EBNFKitTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		8C97E5582F3BE0FE00861414 /* EBNFKit.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; name = EBNFKit.framework; path = /Users/me/Sources/github.com/SemanticKit/Libraries/EBNFKit/build/Debug/EBNFKit.framework; sourceTree = "<absolute>"; };
+		8C97E5632F3BE0FE00861414 /* EBNFKitTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; name = EBNFKitTests.xctest; path = /Users/me/Sources/github.com/SemanticKit/Libraries/EBNFKit/build/Debug/EBNFKitTests.xctest; sourceTree = "<absolute>"; };
+		8C97E5732F3BE12300861414 /* ebnf2.pdf */ = {isa = PBXFileReference; lastKnownFileType = image.pdf; path = ebnf2.pdf; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -50,7 +47,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				8C97E5642F3BE0FE00861414 /* EBNFKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -62,17 +58,16 @@
 			children = (
 				8C97E55A2F3BE0FE00861414 /* EBNFKit */,
 				8C97E5672F3BE0FE00861414 /* EBNFKitTests */,
-				8C97E5592F3BE0FE00861414 /* Products */,
+				8C97E5722F3BE12200861414 /* RFCs */,
 			);
 			sourceTree = "<group>";
 		};
-		8C97E5592F3BE0FE00861414 /* Products */ = {
+		8C97E5722F3BE12200861414 /* RFCs */ = {
 			isa = PBXGroup;
 			children = (
-				8C97E5582F3BE0FE00861414 /* EBNFKit.framework */,
-				8C97E5632F3BE0FE00861414 /* EBNFKitTests.xctest */,
+				8C97E5732F3BE12300861414 /* ebnf2.pdf */,
 			);
-			name = Products;
+			path = RFCs;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -162,7 +157,7 @@
 			mainGroup = 8C97E54E2F3BE0FE00861414;
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
-			productRefGroup = 8C97E5592F3BE0FE00861414 /* Products */;
+			productRefGroup = 8C97E54E2F3BE0FE00861414;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
