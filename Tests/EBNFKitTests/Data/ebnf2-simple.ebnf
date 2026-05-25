@@ -1,0 +1,3 @@
+identifier ::= letter { letter | digit | '_' }
+letter ::= 'a' | 'b' | 'c'
+digit ::= '0' | '1' | '2'

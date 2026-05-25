@@ -1,0 +1,51 @@
+/* Namespaces in XML 1.0 (Third Edition)
+ * version https://www.w3.org/TR/2009/REC-xml-names-20091208/
+ * extracted from https://www.w3.org/TR/xml-names/ on Tue Feb 10, 2026, 16:57 (UTC-07)
+ */
+
+NSAttName
+         ::= PrefixedAttName
+           | DefaultAttName
+PrefixedAttName
+         ::= 'xmlns:' NCName
+          /* NSC: Reserved Prefixes and Namespace Names */
+DefaultAttName
+         ::= 'xmlns'
+NCName   ::= Name - (Char* ':' Char*)
+          /* An XML Name, minus the ":" */
+QName    ::= PrefixedName
+           | UnprefixedName
+PrefixedName
+         ::= Prefix ':' LocalPart
+UnprefixedName
+         ::= LocalPart
+Prefix   ::= NCName
+LocalPart
+         ::= NCName
+STag     ::= '<' QName (S Attribute)* S? '>'
+          /* NSC: Prefix Declared */
+ETag     ::= '</' QName S? '>'
+          /* NSC: Prefix Declared */
+EmptyElemTag
+         ::= '<' QName (S Attribute)* S? '/>'
+          /* NSC: Prefix Declared */
+Attribute
+         ::= NSAttName Eq AttValue
+           | QName Eq AttValue
+          /* NSC: Prefix Declared */
+          /* NSC: No Prefix Undeclaring */
+          /* NSC: Attributes Unique */
+doctypedecl
+         ::= '<!DOCTYPE' S QName (S ExternalID)? S? ('[' (markupdecl | PEReference | S)* ']' S?)? '>'
+elementdecl
+         ::= '<!ELEMENT' S QName S contentspec S? '>'
+cp       ::= (QName | choice | seq) ('?' | '*' | '+')?
+Mixed    ::= '(' S? '#PCDATA' (S? '|' S? QName)* S? ')*'
+           | '(' S? '#PCDATA' S? ')'
+AttlistDecl
+         ::= '<!ATTLIST' S QName AttDef* S? '>'
+AttDef   ::= S (QName | NSAttName) S AttType S DefaultDecl
+NCNameChar
+         ::= NameChar - ':' /* An XML NameChar, minus the ":" */
+NCNameStartChar
+         ::= NCName - ( Char Char Char* ) /* The first letter of an NCName */
