@@ -991,11 +991,16 @@ private struct MatcherEmitter {
             let leftInput = fresh()
             line("    let \(leftInput) = [\(step)]", indent)
             let leftOutput = try emit(left, from: leftInput, record: record, indent: indent + 1)
-            let rightInput = fresh()
-            line("    let \(rightInput) = [Step(end: \(step).end, trace: nil)]", indent)
-            let rightOutput = try emit(right, from: rightInput, record: false, indent: indent + 1)
+            // B only needs to match as far as A reaches: it reads the
+            // characters up to the end of A's longest match.
             let excluded = fresh("excluded")
-            line("    let \(excluded) = Swift.Set(\(rightOutput).map(\\.end))", indent)
+            line("    let \(excluded): Swift.Set<Swift.Int> = {", indent)
+            line("        let s = Swift.Array(s[..<(\(leftOutput).map(\\.end).max() ?? \(step).end)])", indent)
+            let rightInput = fresh()
+            line("        let \(rightInput) = [Step(end: \(step).end, trace: nil)]", indent)
+            let rightOutput = try emit(right, from: rightInput, record: false, indent: indent + 2)
+            line("        return Swift.Set(\(rightOutput).map(\\.end))", indent)
+            line("    }()", indent)
             line("    \(output) += \(leftOutput).filter { !\(excluded).contains($0.end) }", indent)
             line("}", indent)
             return output
