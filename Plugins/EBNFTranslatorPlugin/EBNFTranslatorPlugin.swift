@@ -21,9 +21,7 @@ struct EBNFTranslatorPlugin: BuildToolPlugin {
     func createBuildCommands(context: PluginContext, target: any Target) throws -> [Command] {
         guard let target = target as? any SourceModuleTarget else { return [] }
         let tool = try context.tool(named: "EBNFTranslator")
-        let configurations = target.sourceFiles.map(\.url)
-            .filter { $0.lastPathComponent.hasSuffix(".grammar.json") }
-            .sorted { $0.path < $1.path }
+        let configurations = Self.configurations(in: target.directoryURL)
         return try configurations.map { url in
             let configuration = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: url))
             let directory = url.deletingLastPathComponent()
@@ -36,5 +34,19 @@ struct EBNFTranslatorPlugin: BuildToolPlugin {
                 outputFiles: [output]
             )
         }
+    }
+
+    /// The `*.grammar.json` files under `directory`, in path order.
+    ///
+    /// The plugin looks in the target's directory itself rather than in its
+    /// source files, so that it finds the grammars whether the target
+    /// declares them as sources or as a resource directory, which a package
+    /// copies whole (`.copy`), so that its files are not listed one by one.
+    static func configurations(in directory: URL) -> [URL] {
+        let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)?
+            .compactMap { $0 as? URL } ?? []
+        return files
+            .filter { $0.lastPathComponent.hasSuffix(".grammar.json") }
+            .sorted { $0.path < $1.path }
     }
 }
