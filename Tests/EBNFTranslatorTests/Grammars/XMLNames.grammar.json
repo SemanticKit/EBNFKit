@@ -1,0 +1,20 @@
+{
+  "name": "XMLNames",
+  "documents": [
+    {
+      "file": "xml-names.html",
+      "url": "https://www.w3.org/TR/2009/REC-xml-names-20091208/",
+      "retrieved": "2026-10-30",
+      "sha256": "b4a649e5fdab9852d68eca21442481599164949bcdee5549f2ec7e38fb3cd3a8",
+      "format": "scraps"
+    },
+    {
+      "file": "xml.html",
+      "url": "https://www.w3.org/TR/2008/REC-xml-20081126/",
+      "retrieved": "2026-10-30",
+      "sha256": "f58a4b9e1e5b8bac13fb55c4e5c7c8c5e2c176aa45ee68e2f1ab2498511927ec",
+      "format": "scraps"
+    }
+  ],
+  "roots": ["NCName", "Char"]
+}

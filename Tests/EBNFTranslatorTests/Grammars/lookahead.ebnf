@@ -1,0 +1,12 @@
+/* A grammar for the translator tests whose decisions need a second
+ * terminal, as N-Triples' do, try an alternative that matches nothing
+ * after the others, or try an alternative after one that matches a prefix
+ * of the input. */
+doc   ::= line? (EOL line)* EOL?
+line  ::= (X? | Y) Z
+pair  ::= (X Y | X) Z
+@terminals
+X     ::= 'x'
+Y     ::= 'y'
+Z     ::= 'z'
+EOL   ::= #xA

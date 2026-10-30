@@ -1,0 +1,11 @@
+{
+  "name": "NTriples",
+  "documents": [
+    {
+      "file": "ntriples.bnf",
+      "url": "https://www.w3.org/TR/2026/WD-rdf12-n-triples-20261023/ntriples.bnf",
+      "retrieved": "2026-10-30",
+      "sha256": "e06b4bb2983f2106d69f984dbe3e8cb44f7c43e95bfe4f285158da05780983a1"
+    }
+  ]
+}
