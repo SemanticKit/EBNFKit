@@ -1,0 +1,4 @@
+/* A grammar for the translator tests: a terminal that refers to itself, which
+ * no automaton matches, and a difference. */
+Group  ::= "(" Group* ")"
+Word   ::= [a-z]+ - ("no" | "on")

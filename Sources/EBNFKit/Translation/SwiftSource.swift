@@ -77,6 +77,9 @@ private struct Translation {
         var part: Part?
     }
 
+    /// The first characters of each production matched over characters.
+    let firstCharacters: [String: FirstCharacters]
+
     var parserMethods: [String] = []
     var nested: [String: [String]] = [:]
     var nestedNames: [String: Set<String>] = [:]
@@ -138,6 +141,7 @@ private struct Translation {
         }
         lexerTerminals = productions.map(\.symbol).filter { terminals.contains($0) }
         self.literals = literals
+        firstCharacters = FirstCharacters.of(productions.filter { !tokenLevel.contains($0.symbol) }, bySymbol: bySymbol)
     }
 
     static func checkTokenLevel(_ expression: Expression, in symbol: String, tokenLevel: Set<String>) throws(TranslationError) {
@@ -264,8 +268,16 @@ private struct Translation {
                 let end: Swift.Int
                 let trace: Trace?
 
+                /// `ends` without a second copy of an end.
+                static func uniqueEnds(_ ends: [Swift.Int]) -> [Swift.Int] {
+                    guard ends.count > 1 else { return ends }
+                    var seen = Swift.Set<Swift.Int>()
+                    return ends.filter { seen.insert($0).inserted }
+                }
+
                 /// `steps` without a second step to the same end.
                 static func unique(_ steps: [Step]) -> [Step] {
+                    guard steps.count > 1 else { return steps }
                     var ends = Swift.Set<Swift.Int>()
                     return steps.filter { ends.insert($0.end).inserted }
                 }
@@ -317,8 +329,17 @@ private struct Translation {
 
     func terminalDeclaration(_ production: Production) throws(TranslationError) -> [String] {
         let type = SwiftName.type(production.symbol)
-        var emitter = MatcherEmitter(bySymbol: bySymbol)
-        let body = try emitter.function(for: production.expression)
+        var emitter = MatcherEmitter(bySymbol: bySymbol, firstCharacters: firstCharacters)
+        // A regular production is matched by its automaton; one that refers
+        // back to itself, by following the positions its expression reaches.
+        let endsBody: [String]
+        if let automaton = Automaton(production.expression, bySymbol: bySymbol) {
+            endsBody = Self.automatonBody(automaton)
+        } else {
+            endsBody = try emitter.function(for: production.expression, mode: .ends)
+        }
+        let direct = Self.directSymbols(production.expression)
+        let stepsBody = direct.isEmpty ? [] : try emitter.function(for: production.expression, mode: .steps)
         var lines: [String] = []
         lines.append("extension \(namespace) {")
         lines.append("    /// `\(production.symbol) ::= \(production.expression.notation)`")
@@ -342,21 +363,40 @@ private struct Translation {
         lines.append("        /// Whether all of `text` matches the production.")
         lines.append("        static func matches(_ text: Swift.String) -> Swift.Bool {")
         lines.append("            let scalars = Swift.Array(text.unicodeScalars)")
-        lines.append("            return match(scalars, 0, false).contains { $0.end == scalars.count }")
+        lines.append("            return ends(scalars, 0).contains(scalars.count)")
+        lines.append("        }")
+        lines.append("")
+        let first = firstCharacters[production.symbol] ?? .unknown
+        lines.append("        /// Whether a match of the production can start with the character")
+        lines.append("        /// `value`.")
+        lines.append("        static func starts(_ value: Swift.UInt32) -> Swift.Bool {")
+        if first.isUnbounded {
+            lines.append("            true")
+        } else {
+            let positive = first.classes.filter { !$0.isNegated }.flatMap(\.ranges)
+            let negative = first.classes.filter(\.isNegated)
+            var tests: [String] = []
+            if !positive.isEmpty {
+                tests.append("{ switch value { case \(positive.map(Self.range).joined(separator: ", ")): return true; default: return false } }()")
+            }
+            for characterClass in negative {
+                tests.append("{ switch value { case \(characterClass.ranges.map(Self.range).joined(separator: ", ")): return false; default: return true } }()")
+            }
+            lines.append("            " + (tests.isEmpty ? "false" : tests.joined(separator: " || ")))
+        }
         lines.append("        }")
         lines.append("")
         lines.append("        /// The end of the longest match of the production at `offset`.")
         lines.append("        static func longestMatch(in scalars: [Swift.Unicode.Scalar], at offset: Swift.Int) -> Swift.Int? {")
-        lines.append("            match(scalars, offset, false).map(\\.end).max()")
+        lines.append("            ends(scalars, offset).max()")
         lines.append("        }")
 
-        let direct = Self.directSymbols(production.expression)
         if !direct.isEmpty {
             lines.append("")
             lines.append("        /// The trace of the productions the text matched on the way.")
             lines.append("        private var trace: Trace? {")
             lines.append("            let scalars = Swift.Array(text.unicodeScalars)")
-            lines.append("            return Self.match(scalars, 0, true).first { $0.end == scalars.count }?.trace")
+            lines.append("            return Self.match(scalars, 0).first { $0.end == scalars.count }?.trace")
             lines.append("        }")
             for symbol in direct {
                 let count = Self.occurrences(of: symbol, in: production.expression)
@@ -384,16 +424,33 @@ private struct Translation {
                     lines.append("        /// The `\(symbol)`s the text holds, in order.")
                 }
                 lines.append("        var \(member): \(returnType) {")
-                lines.append("            \(expression)")
+                if count.min == 0, firstCharacters[symbol]?.mustAlwaysTry == false {
+                    // No character of the text can start one: none is there.
+                    lines.append("            guard text.unicodeScalars.contains(where: { \(part).starts($0.value) }) else { return \(count.max == 1 ? "nil" : "[]") }")
+                    lines.append("            return \(expression)")
+                } else {
+                    lines.append("            \(expression)")
+                }
                 lines.append("        }")
             }
         }
         lines.append("")
-        lines.append("        /// The ways the production matches from `offset`, recording the")
-        lines.append("        /// productions it refers to when `record` is true.")
-        lines.append("        static func match(_ s: [Swift.Unicode.Scalar], _ offset: Swift.Int, _ record: Swift.Bool) -> [Step] {")
-        lines.append(contentsOf: body.map { "            " + $0 })
+        lines.append("        /// The ends of the matches of the production from `offset`.")
+        lines.append("        static func ends(_ s: [Swift.Unicode.Scalar], _ offset: Swift.Int) -> [Swift.Int] {")
+        lines.append(contentsOf: endsBody.map { "            " + $0 })
         lines.append("        }")
+        if !stepsBody.isEmpty {
+            lines.append("")
+            lines.append("        /// The matches of the production from `offset`, each with where the")
+            lines.append("        /// productions it refers to matched on the way.")
+            lines.append("        static func match(_ s: [Swift.Unicode.Scalar], _ offset: Swift.Int) -> [Step] {")
+            lines.append(contentsOf: stepsBody.map { "            " + $0 })
+            lines.append("        }")
+        }
+        for (index, string) in emitter.strings.enumerated() {
+            lines.append("")
+            lines.append("        static let string\(index): [Swift.UInt32] = [\(string.map(Self.hex).joined(separator: ", "))]")
+        }
         for (index, characterClass) in emitter.classes.enumerated() {
             lines.append("")
             lines.append("        /// `\(Expression.characterClass(characterClass).notation)`")
@@ -410,6 +467,44 @@ private struct Translation {
         lines.append("    }")
         lines.append("}")
         return lines
+    }
+
+    /// The body of `ends(_:_:)` for a production matched by `automaton`:
+    /// it reads the characters from `offset` and records each position where
+    /// the automaton accepts.
+    static func automatonBody(_ automaton: Automaton) -> [String] {
+        var lines = ["var ends: [Swift.Int] = []", "var state = 0", "var index = offset", "while true {"]
+        let accepting = automaton.accepting.indices.filter { automaton.accepting[$0] }
+        if !accepting.isEmpty {
+            lines.append("    switch state {")
+            lines.append("    case \(accepting.map(String.init).joined(separator: ", ")): ends.append(index)")
+            lines.append("    default: break")
+            lines.append("    }")
+        }
+        lines.append("    guard index < s.count else { return ends }")
+        lines.append("    let value = s[index].value")
+        lines.append("    switch state {")
+        for (state, row) in automaton.transitions.enumerated() where !row.isEmpty {
+            lines.append("    case \(state):")
+            lines.append("        switch value {")
+            var targets: [Int] = []
+            for transition in row where !targets.contains(transition.target) { targets.append(transition.target) }
+            for target in targets {
+                let ranges = row.filter { $0.target == target }.map { range($0.range) }
+                lines.append("        case \(ranges.joined(separator: ", ")): state = \(target)")
+            }
+            lines.append("        default: return ends")
+            lines.append("        }")
+        }
+        lines.append("    default: return ends")
+        lines.append("    }")
+        lines.append("    index += 1")
+        lines.append("}")
+        return lines
+    }
+
+    static func range(_ range: ClosedRange<UInt32>) -> String {
+        range.lowerBound == range.upperBound ? hex(range.lowerBound) : hex(range.lowerBound) + "..." + hex(range.upperBound)
     }
 
     static func hex(_ value: UInt32) -> String {
@@ -513,7 +608,8 @@ private struct Translation {
         lines.append("                }")
         for terminal in lexerTerminals {
             let type = SwiftName.type(terminal)
-            lines.append("                if let match = \(type).longestMatch(in: s, at: offset), match > end {")
+            let filter = firstCharacters[terminal]?.mustAlwaysTry == false ? "\(type).starts(s[offset].value), " : ""
+            lines.append("                if \(filter)let match = \(type).longestMatch(in: s, at: offset), match > end {")
             lines.append("                    end = match")
             lines.append("                    kind = .\(type)")
             lines.append("                }")
@@ -880,26 +976,39 @@ private struct Translation {
 }
 
 /// Writes the body of a function that matches an expression over
-/// characters: each expression turns the steps that reach its start into
-/// the steps that reach its end.
+/// characters: each expression turns the positions that reach its start
+/// into the positions that reach its end.
+///
+/// In ``Mode/ends`` the positions are offsets. In ``Mode/steps`` they are
+/// steps, which also record where each production the expression refers to
+/// matched; the productions it refers to are matched for their ends only.
 private struct MatcherEmitter {
-    let bySymbol: [String: Production]
-    var lines: [String] = []
-    var counter = 0
-    var classes: [CharacterClass] = []
-
-    init(bySymbol: [String: Production]) {
-        self.bySymbol = bySymbol
+    enum Mode {
+        case ends
+        case steps
     }
 
-    mutating func function(for expression: Expression) throws(TranslationError) -> [String] {
-        lines = ["let start: [Step] = [Step(end: offset, trace: nil)]"]
-        let result = try emit(expression, from: "start", record: true, indent: 0)
+    let bySymbol: [String: Production]
+    let firstCharacters: [String: FirstCharacters]
+    var classes: [CharacterClass] = []
+    /// The strings of more than one character the expression matches.
+    var strings: [[UInt32]] = []
+    var lines: [String] = []
+    var counter = 0
+
+    init(bySymbol: [String: Production], firstCharacters: [String: FirstCharacters]) {
+        self.bySymbol = bySymbol
+        self.firstCharacters = firstCharacters
+    }
+
+    mutating func function(for expression: Expression, mode: Mode) throws(TranslationError) -> [String] {
+        lines = [mode == .ends ? "let start: [Swift.Int] = [offset]" : "let start: [Step] = [Step(end: offset, trace: nil)]"]
+        let result = try emit(expression, from: "start", mode: mode, indent: 0)
         lines.append("return \(result)")
         return lines
     }
 
-    mutating func fresh(_ prefix: String = "steps") -> String {
+    mutating func fresh(_ prefix: String = "positions") -> String {
         counter += 1
         return "\(prefix)\(counter)"
     }
@@ -908,37 +1017,69 @@ private struct MatcherEmitter {
         lines.append(String(repeating: "    ", count: indent) + text)
     }
 
-    /// Writes the steps after `expression` from the steps in `input`, and
-    /// returns the variable that holds them.
-    mutating func emit(_ expression: Expression, from input: String, record: Bool, indent: Int) throws(TranslationError) -> String {
+    func type(_ mode: Mode) -> String {
+        mode == .ends ? "[Swift.Int]" : "[Step]"
+    }
+
+    /// `position` advanced by `count` characters, in `mode`.
+    func advanced(_ position: String, by count: String, _ mode: Mode) -> String {
+        mode == .ends ? "\(position) + \(count)" : "Step(end: \(position).end + \(count), trace: \(position).trace)"
+    }
+
+    func end(_ position: String, _ mode: Mode) -> String {
+        mode == .ends ? position : "\(position).end"
+    }
+
+    func unique(_ mode: Mode) -> String {
+        mode == .ends ? "Step.uniqueEnds" : "Step.unique"
+    }
+
+    /// Writes the positions after `expression` from the positions in
+    /// `input`, and returns the variable that holds them.
+    mutating func emit(_ expression: Expression, from input: String, mode: Mode, indent: Int) throws(TranslationError) -> String {
         switch expression {
         case .symbol(let symbol):
             guard bySymbol[symbol] != nil else { throw TranslationError("'\(symbol)' is used but not defined") }
             let type = SwiftName.type(symbol)
             let output = fresh()
-            let trace = record ? "record ? Trace(.\(type), step.end, match.end, step.trace) : step.trace" : "step.trace"
-            line("var \(output): [Step] = []", indent)
-            line("for step in \(input) {", indent)
-            line("    for match in \(type).match(s, step.end, false) {", indent)
-            line("        \(output).append(Step(end: match.end, trace: \(trace)))", indent)
-            line("    }", indent)
+            let at = end("position", mode)
+            line("var \(output): \(self.type(mode)) = []", indent)
+            if firstCharacters[symbol]?.mustAlwaysTry == false {
+                line("for position in \(input) where \(at) < s.count && \(type).starts(s[\(at)].value) {", indent)
+            } else {
+                line("for position in \(input) {", indent)
+            }
+            switch mode {
+            case .ends:
+                line("    \(output) += \(type).ends(s, position)", indent)
+            case .steps:
+                line("    for end in \(type).ends(s, position.end) {", indent)
+                line("        \(output).append(Step(end: end, trace: Trace(.\(type), position.end, end, position.trace)))", indent)
+                line("    }", indent)
+            }
             line("}", indent)
-            line("\(output) = Step.unique(\(output))", indent)
+            line("\(output) = \(unique(mode))(\(output))", indent)
             return output
         case .string(let text, _):
-            let scalars = text.unicodeScalars.map { Translation.hex($0.value) }.joined(separator: ", ")
-            let count = text.unicodeScalars.count
+            let scalars = text.unicodeScalars.map(\.value)
             let output = fresh()
-            line("var \(output): [Step] = []", indent)
-            line("for step in \(input) where Step.has(s, step.end, [\(scalars)]) {", indent)
-            line("    \(output).append(Step(end: step.end + \(count), trace: step.trace))", indent)
+            let at = end("position", mode)
+            line("var \(output): \(type(mode)) = []", indent)
+            if scalars.count == 1 {
+                line("for position in \(input) where \(at) < s.count && s[\(at)].value == \(Translation.hex(scalars[0])) {", indent)
+            } else {
+                if !strings.contains(scalars) { strings.append(scalars) }
+                line("for position in \(input) where Step.has(s, \(at), string\(strings.firstIndex(of: scalars)!)) {", indent)
+            }
+            line("    \(output).append(\(advanced("position", by: String(scalars.count), mode)))", indent)
             line("}", indent)
             return output
         case .character(let value):
             let output = fresh()
-            line("var \(output): [Step] = []", indent)
-            line("for step in \(input) where step.end < s.count && s[step.end].value == \(Translation.hex(value)) {", indent)
-            line("    \(output).append(Step(end: step.end + 1, trace: step.trace))", indent)
+            let at = end("position", mode)
+            line("var \(output): \(type(mode)) = []", indent)
+            line("for position in \(input) where \(at) < s.count && s[\(at)].value == \(Translation.hex(value)) {", indent)
+            line("    \(output).append(\(advanced("position", by: "1", mode)))", indent)
             line("}", indent)
             return output
         case .characterClass(let characterClass):
@@ -950,77 +1091,79 @@ private struct MatcherEmitter {
                 index = classes.count - 1
             }
             let output = fresh()
-            line("var \(output): [Step] = []", indent)
-            line("for step in \(input) where step.end < s.count && class\(index)(s[step.end].value) {", indent)
-            line("    \(output).append(Step(end: step.end + 1, trace: step.trace))", indent)
+            let at = end("position", mode)
+            line("var \(output): \(type(mode)) = []", indent)
+            line("for position in \(input) where \(at) < s.count && class\(index)(s[\(at)].value) {", indent)
+            line("    \(output).append(\(advanced("position", by: "1", mode)))", indent)
             line("}", indent)
             return output
         case .sequence(let items):
             var current = input
             for item in items {
-                current = try emit(item, from: current, record: record, indent: indent)
+                current = try emit(item, from: current, mode: mode, indent: indent)
             }
             return current
         case .choice(let options):
             var outputs: [String] = []
             for option in options {
-                outputs.append(try emit(option, from: input, record: record, indent: indent))
+                outputs.append(try emit(option, from: input, mode: mode, indent: indent))
             }
             let output = fresh()
             line("var \(output) = \(outputs[0])", indent)
             for other in outputs.dropFirst() {
                 line("\(output) += \(other)", indent)
             }
-            line("\(output) = Step.unique(\(output))", indent)
+            line("\(output) = \(unique(mode))(\(output))", indent)
             return output
         case .optional(let item):
-            let inner = try emit(item, from: input, record: record, indent: indent)
+            let inner = try emit(item, from: input, mode: mode, indent: indent)
             let output = fresh()
-            line("let \(output) = Step.unique(\(input) + \(inner))", indent)
+            line("let \(output) = \(unique(mode))(\(input) + \(inner))", indent)
             return output
         case .zeroOrMore(let item):
-            return try repetition(item, from: input, record: record, indent: indent)
+            return try repetition(item, from: input, mode: mode, indent: indent)
         case .oneOrMore(let item):
-            let first = try emit(item, from: input, record: record, indent: indent)
-            return try repetition(item, from: first, record: record, indent: indent)
+            let first = try emit(item, from: input, mode: mode, indent: indent)
+            return try repetition(item, from: first, mode: mode, indent: indent)
         case .difference(let left, let right):
             let output = fresh()
-            let step = fresh("step")
-            line("var \(output): [Step] = []", indent)
-            line("for \(step) in \(input) {", indent)
+            let position = fresh("position")
+            line("var \(output): \(type(mode)) = []", indent)
+            line("for \(position) in \(input) {", indent)
             let leftInput = fresh()
-            line("    let \(leftInput) = [\(step)]", indent)
-            let leftOutput = try emit(left, from: leftInput, record: record, indent: indent + 1)
+            line("    let \(leftInput) = [\(position)]", indent)
+            let leftOutput = try emit(left, from: leftInput, mode: mode, indent: indent + 1)
             // B only needs to match as far as A reaches: it reads the
             // characters up to the end of A's longest match.
             let excluded = fresh("excluded")
+            let leftEnds = mode == .ends ? leftOutput : "\(leftOutput).map(\\.end)"
             line("    let \(excluded): Swift.Set<Swift.Int> = {", indent)
-            line("        let s = Swift.Array(s[..<(\(leftOutput).map(\\.end).max() ?? \(step).end)])", indent)
+            line("        let s = Swift.Array(s[..<(\(leftEnds).max() ?? \(end(position, mode)))])", indent)
             let rightInput = fresh()
-            line("        let \(rightInput) = [Step(end: \(step).end, trace: nil)]", indent)
-            let rightOutput = try emit(right, from: rightInput, record: false, indent: indent + 2)
-            line("        return Swift.Set(\(rightOutput).map(\\.end))", indent)
+            line("        let \(rightInput) = [\(end(position, mode))]", indent)
+            let rightOutput = try emit(right, from: rightInput, mode: .ends, indent: indent + 2)
+            line("        return Swift.Set(\(rightOutput))", indent)
             line("    }()", indent)
-            line("    \(output) += \(leftOutput).filter { !\(excluded).contains($0.end) }", indent)
+            line("    \(output) += \(leftOutput).filter { !\(excluded).contains(\(end("$0", mode))) }", indent)
             line("}", indent)
             return output
         }
     }
 
-    /// `item*` from the steps in `input`: each round takes the steps that
-    /// reach a new end.
-    mutating func repetition(_ item: Expression, from input: String, record: Bool, indent: Int) throws(TranslationError) -> String {
+    /// `item*` from the positions in `input`: each round takes the
+    /// positions that reach a new end.
+    mutating func repetition(_ item: Expression, from input: String, mode: Mode, indent: Int) throws(TranslationError) -> String {
         let output = fresh()
         let frontier = fresh("frontier")
         let ends = fresh("ends")
         line("var \(output) = \(input)", indent)
         line("var \(frontier) = \(input)", indent)
-        line("var \(ends) = Swift.Set(\(input).map(\\.end))", indent)
+        line("var \(ends) = Swift.Set(\(mode == .ends ? input : "\(input).map(\\.end)"))", indent)
         line("while !\(frontier).isEmpty {", indent)
         let round = fresh()
         line("    let \(round) = \(frontier)", indent)
-        let inner = try emit(item, from: round, record: record, indent: indent + 1)
-        line("    \(frontier) = \(inner).filter { \(ends).insert($0.end).inserted }", indent)
+        let inner = try emit(item, from: round, mode: mode, indent: indent + 1)
+        line("    \(frontier) = \(inner).filter { \(ends).insert(\(end("$0", mode))).inserted }", indent)
         line("    \(output) += \(frontier)", indent)
         line("}", indent)
         return output

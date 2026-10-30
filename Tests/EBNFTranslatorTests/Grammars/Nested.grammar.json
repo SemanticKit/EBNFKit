@@ -1,0 +1,11 @@
+{
+  "name": "Nested",
+  "documents": [
+    {
+      "file": "nested.ebnf",
+      "url": "https://github.com/SemanticKit/EBNFKit/blob/main/Tests/EBNFTranslatorTests/Grammars/nested.ebnf",
+      "retrieved": "2026-10-30",
+      "sha256": "0a8332807174b48420c0a13e2d4d9ccc2ae8afe90cda5117df4a459922c73101"
+    }
+  ]
+}
