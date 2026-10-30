@@ -47,3 +47,12 @@ extension NTriplesGrammar {
         return index
     }
 }
+
+extension LookaheadGrammar {
+    /// Spaces between terminals; a line feed is the terminal `EOL`.
+    static func trivia(_ scalars: [Unicode.Scalar], from offset: Int) -> Int {
+        var index = offset
+        while index < scalars.count, scalars[index] == " " { index += 1 }
+        return index
+    }
+}

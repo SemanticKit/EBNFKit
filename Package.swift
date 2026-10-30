@@ -19,13 +19,19 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.3")
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.3"),
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "604.0.0")
     ],
     targets: [
         .target(
             name: "EBNFKit",
             dependencies: [
-                .product(name: "Crypto", package: "swift-crypto")
+                .product(name: "Crypto", package: "swift-crypto"),
+                // The translation builds the Swift it writes as syntax nodes.
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
+                .product(name: "SwiftBasicFormat", package: "swift-syntax"),
+                .product(name: "SwiftParser", package: "swift-syntax")
             ]
         ),
 

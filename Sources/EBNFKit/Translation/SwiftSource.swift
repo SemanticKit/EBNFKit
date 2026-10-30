@@ -1,7 +1,12 @@
+import SwiftBasicFormat
+import SwiftSyntax
+import SwiftSyntaxBuilder
+
 /// The Swift translation of a ``Grammar``: a parser that reads the grammar's
 /// language into a typed syntax tree, one Swift type per production.
 ///
-/// The translation is deterministic: the same grammar and configuration
+/// The translation builds its declarations as swift-syntax nodes and writes
+/// them formatted. It is deterministic: the same grammar and configuration
 /// always give the same text. Everything it declares is in the namespace
 /// `<name>Grammar`:
 ///
@@ -22,7 +27,11 @@
 ///   chosen"); a production whose expression is a choice becomes an enum
 ///   with a case for each alternative, and any other production a class
 ///   with a member for each part of its expression that holds something.
-///   Each has a static `parse(_:)`.
+///   Each has a static `parse(_:)`. The parser keeps the first alternative
+///   of a choice that matches and repeats an item while it matches, so the
+///   translation first checks that the next terminals decide each of those
+///   choices (``Lookahead``): then the parser reads exactly the grammar's
+///   language.
 ///
 /// What a specification states in prose rather than EBNF stays with the
 /// code that uses the translation. Before each terminal the tokenizer skips
@@ -37,11 +46,13 @@ public struct SwiftSource: Sendable, Hashable {
     ///
     /// - Throws: ``TranslationError`` when a symbol is not defined, a
     ///   production that is read over terminals uses a character class or
-    ///   `-`, a terminal refers to a production read over terminals, or two
-    ///   symbols would have the same Swift name.
+    ///   `-`, a terminal refers to a production read over terminals, the
+    ///   next two terminals do not decide a choice, `?`, `*` or `+` of the
+    ///   productions read over terminals, or two symbols would have the same
+    ///   Swift name.
     public init(grammar: Grammar, configuration: GrammarConfiguration) throws(TranslationError) {
         var translation = try Translation(grammar: grammar, configuration: configuration)
-        text = try translation.render()
+        text = try translation.sourceFile().formatted().description
     }
 }
 
@@ -58,6 +69,8 @@ private struct Translation {
     let lexerTerminals: [String]
     /// The strings the tokenizer recognizes, in order of first appearance.
     let literals: [Literal]
+    /// What the next terminals tell the parser.
+    let lookahead: Lookahead
 
     struct Literal: Hashable {
         var text: String
@@ -67,11 +80,11 @@ private struct Translation {
     /// What one expression of a production read over terminals holds.
     struct Part {
         /// Its Swift type.
-        var type: String
+        var type: TypeSyntax
         /// The member name it is held under.
         var name: String
         /// The labels and types of its parts, when it is a tuple.
-        var fields: [(name: String, type: String)]?
+        var fields: [(name: String, type: TypeSyntax)]?
     }
 
     /// A parsing method, and what it returns besides failure.
@@ -83,8 +96,8 @@ private struct Translation {
     /// The first characters of each production matched over characters.
     let firstCharacters: [String: FirstCharacters]
 
-    var parserMethods: [String] = []
-    var nested: [String: [String]] = [:]
+    var parserMethods: [FunctionDeclSyntax] = []
+    var nested: [String: [EnumDeclSyntax]] = [:]
     var nestedNames: [String: Set<String>] = [:]
     var methodCounter = 0
 
@@ -145,6 +158,13 @@ private struct Translation {
         lexerTerminals = productions.map(\.symbol).filter { terminals.contains($0) }
         self.literals = literals
         firstCharacters = FirstCharacters.of(productions.filter { !tokenLevel.contains($0.symbol) }, bySymbol: bySymbol)
+
+        var tokenProductions: [String: Expression] = [:]
+        for production in productions where tokenLevel.contains(production.symbol) {
+            tokenProductions[production.symbol] = production.expression
+        }
+        lookahead = Lookahead(productions: tokenProductions, caseInsensitiveStrings: configuration.caseInsensitiveStrings)
+        try lookahead.check()
     }
 
     static func checkTokenLevel(_ expression: Expression, in symbol: String, tokenLevel: Set<String>) throws(TranslationError) {
@@ -179,339 +199,539 @@ private struct Translation {
         }
     }
 
-    // MARK: - Rendering
+    // MARK: - Names and types
 
-    mutating func render() throws(TranslationError) -> String {
-        var out: [String] = []
-        out.append("// The Swift translation of the \(configuration.name) grammar, written by")
-        out.append("// EBNFTranslator from the EBNF of:")
-        for document in configuration.documents {
-            out.append("//   \(document.url)")
-            out.append("//     retrieved \(document.retrieved), SHA-256 \(document.sha256)")
-        }
-        out.append("// Do not edit it: it is translated again from the grammar on every build.")
-        out.append("")
-        out.append("/// The \(configuration.name) grammar: one type for each of its productions.")
-        out.append("enum \(namespace) {}")
-        out.append("")
-        out.append(contentsOf: supportDeclarations())
+    /// The namespace, as a type.
+    var namespaceType: TypeSyntax { .named(namespace) }
 
-        for production in productions where !tokenLevel.contains(production.symbol) {
-            out.append("")
-            out.append(contentsOf: try terminalDeclaration(production))
-        }
-
-        guard !tokenLevel.isEmpty else { return out.joined(separator: "\n") + "\n" }
-
-        var nodeDeclarations: [String] = []
-        for production in productions where tokenLevel.contains(production.symbol) {
-            nodeDeclarations.append(contentsOf: try nodeDeclaration(production))
-        }
-        out.append("")
-        out.append(contentsOf: tokenDeclarations())
-        out.append(contentsOf: nodeDeclarations)
-        for owner in nested.keys.sorted() {
-            out.append("")
-            out.append("extension \(namespace).\(owner) {")
-            out.append(contentsOf: nested[owner, default: []])
-            out.append("}")
-        }
-        out.append("")
-        out.append(contentsOf: parserDeclaration())
-        return out.joined(separator: "\n") + "\n"
+    /// The type of `symbol`'s production, in the namespace.
+    func qualified(_ symbol: String) -> TypeSyntax {
+        namespaceType.member(SwiftName.type(symbol))
     }
 
-    func supportDeclarations() -> [String] {
+    static var int: TypeSyntax { .swift("Int") }
+    static var bool: TypeSyntax { .swift("Bool") }
+    static var string: TypeSyntax { .swift("String") }
+    static var uint32: TypeSyntax { .swift("UInt32") }
+
+    // MARK: - The source file
+
+    mutating func sourceFile() throws(TranslationError) -> SourceFileSyntax {
+        var declarations: [DeclSyntax] = []
+        var header = [
+            "The Swift translation of the \(configuration.name) grammar, written by",
+            "EBNFTranslator from the EBNF of:",
+        ]
+        for document in configuration.documents {
+            header.append("  \(document.url)")
+            header.append("    retrieved \(document.retrieved), SHA-256 \(document.sha256)")
+        }
+        header.append("Do not edit it: it is translated again from the grammar on every build.")
+        declarations.append(DeclSyntax(EnumDeclSyntax(
+            leadingTrivia: Trivia.comment(header) + .newlines(1) + .documentation("The \(configuration.name) grammar: one type for each of its productions."),
+            name: .name(namespace),
+            memberBlock: MemberBlockSyntax(members: [])
+        )))
+        declarations.append(DeclSyntax(supportDeclarations()))
+
+        for production in productions where !tokenLevel.contains(production.symbol) {
+            declarations.append(DeclSyntax(try terminalDeclaration(production)))
+        }
+
+        if !tokenLevel.isEmpty {
+            var nodeDeclarations: [DeclSyntax] = []
+            for production in productions where tokenLevel.contains(production.symbol) {
+                nodeDeclarations += try nodeDeclaration(production)
+            }
+            declarations.append(DeclSyntax(tokenDeclarations()))
+            declarations += nodeDeclarations
+            for owner in nested.keys.sorted() {
+                let enums = nested[owner, default: []]
+                declarations.append(DeclSyntax(ExtensionDeclSyntax(extendedType: namespaceType.member(owner)) {
+                    for declaration in enums { declaration }
+                }))
+            }
+            declarations.append(DeclSyntax(parserDeclaration()))
+        }
+        return SourceFileSyntax {
+            for declaration in declarations { declaration }
+        }
+    }
+
+    // MARK: - Support
+
+    /// `Location`, `SyntaxError`, `Symbol`, `Step` and `Trace`.
+    func supportDeclarations() -> ExtensionDeclSyntax {
         let symbols = productions.filter { !tokenLevel.contains($0.symbol) }.map { SwiftName.type($0.symbol) }
-        return """
-        extension \(namespace) {
-            /// A position in a document: the offset in Unicode scalars, and
-            /// the 1-based line and column, in Unicode scalars, a line ending
-            /// at each line feed.
-            struct Location: Swift.Sendable, Swift.Hashable {
-                let offset: Swift.Int
-                let line: Swift.Int
-                let column: Swift.Int
-
-                /// The start of a document.
-                static let start = Location(offset: 0, line: 1, column: 1)
-
-                /// The position after `scalars`, which start here.
-                func advanced(over scalars: Swift.ArraySlice<Swift.Unicode.Scalar>) -> Location {
-                    var line = line
-                    var column = column
-                    for scalar in scalars {
-                        if scalar == "\\n" {
-                            line += 1
-                            column = 1
-                        } else {
-                            column += 1
+        let location = TypeSyntax.named("Location")
+        let scalar = TypeSyntax.swift("Unicode").member("Scalar")
+        return ExtensionDeclSyntax(extendedType: namespaceType) {
+            StructDeclSyntax(
+                leadingTrivia: .documentation(
+                    "A position in a document: the offset in Unicode scalars, and",
+                    "the 1-based line and column, in Unicode scalars, a line ending",
+                    "at each line feed."
+                ),
+                name: .name("Location"),
+                inheritanceClause: .swift("Sendable", "Hashable")
+            ) {
+                VariableDeclSyntax.binding("offset", Self.int)
+                VariableDeclSyntax.binding("line", Self.int)
+                VariableDeclSyntax.binding("column", Self.int)
+                VariableDeclSyntax.binding(
+                    "start", nil,
+                    ExprSyntax.named("Location").call(labeled: [("offset", .int(0)), ("line", .int(1)), ("column", .int(1))]),
+                    modifiers: .static,
+                    leadingTrivia: .documentation("The start of a document.")
+                )
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation("The position after `scalars`, which start here."),
+                    name: .name("advanced"),
+                    signature: .of([.parameter("over", "scalars", .swift("ArraySlice", scalar))], returning: location)
+                ) {
+                    VariableDeclSyntax.binding("line", nil, .named("line"), mutable: true)
+                    VariableDeclSyntax.binding("column", nil, .named("column"), mutable: true)
+                    ForStmtSyntax(pattern: IdentifierPatternSyntax(identifier: .name("scalar")), sequence: ExprSyntax.named("scalars")) {
+                        IfExprSyntax(
+                            conditions: .expression(ExprSyntax.named("scalar").dot("value").infix("==", .codePoint(0x0A))),
+                            elseKeyword: .keyword(.else),
+                            elseBody: .codeBlock(CodeBlockSyntax {
+                                ExprSyntax.named("column").infix("+=", .int(1))
+                            })
+                        ) {
+                            ExprSyntax.named("line").infix("+=", .int(1))
+                            ExprSyntax.named("column").assigned(.int(1))
                         }
                     }
-                    return Location(offset: offset + scalars.count, line: line, column: column)
+                    StmtSyntax.return(ExprSyntax.named("Location").call(labeled: [
+                        ("offset", ExprSyntax.named("offset").infix("+", ExprSyntax.named("scalars").dot("count"))),
+                        ("line", .named("line")),
+                        ("column", .named("column")),
+                    ]))
                 }
             }
-
-            /// A document that does not match the grammar.
-            struct SyntaxError: Swift.Error, Swift.Sendable, Swift.Hashable {
-                /// Where the document stops matching.
-                let location: Location
-                /// What the grammar expected there.
-                let message: Swift.String
+            StructDeclSyntax(
+                leadingTrivia: .documentation("A document that does not match the grammar."),
+                name: .name("SyntaxError"),
+                inheritanceClause: .swift("Error", "Sendable", "Hashable")
+            ) {
+                VariableDeclSyntax.binding("location", location, leadingTrivia: .documentation("Where the document stops matching."))
+                VariableDeclSyntax.binding("message", Self.string, leadingTrivia: .documentation("What the grammar expected there."))
             }
-
-            /// The productions matched over characters.
-            enum Symbol: Swift.Sendable, Swift.Hashable {
-                \(symbols.isEmpty ? "" : "case " + symbols.joined(separator: ", "))
-            }
-
-            /// One way a production can match: where it ends, and the
-            /// productions its expression refers to that it matched on the way.
-            struct Step: Swift.Sendable {
-                let end: Swift.Int
-                let trace: Trace?
-
-                /// `ends` without a second copy of an end.
-                static func uniqueEnds(_ ends: [Swift.Int]) -> [Swift.Int] {
-                    guard ends.count > 1 else { return ends }
-                    var seen = Swift.Set<Swift.Int>()
-                    return ends.filter { seen.insert($0).inserted }
-                }
-
-                /// `steps` without a second step to the same end.
-                static func unique(_ steps: [Step]) -> [Step] {
-                    guard steps.count > 1 else { return steps }
-                    var ends = Swift.Set<Swift.Int>()
-                    return steps.filter { ends.insert($0.end).inserted }
-                }
-
-                /// Whether `scalars` has `literal` at `offset`.
-                static func has(_ scalars: [Swift.Unicode.Scalar], _ offset: Swift.Int, _ literal: [Swift.UInt32]) -> Swift.Bool {
-                    guard offset + literal.count <= scalars.count else { return false }
-                    for (index, value) in literal.enumerated() where scalars[offset + index].value != value {
-                        return false
-                    }
-                    return true
-                }
-            }
-
-            /// The matches of referred productions on the way to a step, the
-            /// last first.
-            final class Trace: Swift.Sendable {
-                let symbol: Symbol
-                let start: Swift.Int
-                let end: Swift.Int
-                let previous: Trace?
-
-                init(_ symbol: Symbol, _ start: Swift.Int, _ end: Swift.Int, _ previous: Trace?) {
-                    self.symbol = symbol
-                    self.start = start
-                    self.end = end
-                    self.previous = previous
-                }
-
-                /// The text and location of each match of `symbol` in
-                /// `scalars`, which start at `location`, in document order.
-                func parts(_ symbol: Symbol, in scalars: [Swift.Unicode.Scalar], at location: Location) -> [(text: Swift.String, location: Location)] {
-                    var matches: [Trace] = []
-                    var trace: Trace? = self
-                    while let current = trace {
-                        if current.symbol == symbol { matches.append(current) }
-                        trace = current.previous
-                    }
-                    return matches.reversed().map {
-                        (Swift.String(Swift.String.UnicodeScalarView(scalars[$0.start..<$0.end])), location.advanced(over: scalars[0..<$0.start]))
+            EnumDeclSyntax(
+                leadingTrivia: .documentation("The productions matched over characters."),
+                name: .name("Symbol"),
+                inheritanceClause: .swift("Sendable", "Hashable")
+            ) {
+                if !symbols.isEmpty {
+                    EnumCaseDeclSyntax {
+                        for symbol in symbols { EnumCaseElementSyntax(name: .name(symbol)) }
                     }
                 }
+            }
+            stepDeclaration()
+            traceDeclaration()
+        }
+    }
+
+    func stepDeclaration() -> StructDeclSyntax {
+        let ints = Self.int.array
+        let steps = TypeSyntax.named("Step").array
+        return StructDeclSyntax(
+            leadingTrivia: .documentation(
+                "One way a production can match: where it ends, and the",
+                "productions its expression refers to that it matched on the way."
+            ),
+            name: .name("Step"),
+            inheritanceClause: .swift("Sendable")
+        ) {
+            VariableDeclSyntax.binding("end", Self.int)
+            VariableDeclSyntax.binding("trace", TypeSyntax.named("Trace").optional)
+            for (name, values, type, key) in [("uniqueEnds", "ends", ints, nil), ("unique", "steps", steps, "end")] as [(String, String, TypeSyntax, String?)] {
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation(key == nil ? "`ends` without a second copy of an end." : "`steps` without a second step to the same end."),
+                    modifiers: .static,
+                    name: .name(name),
+                    signature: .of([.parameter(nil, values, type)], returning: type)
+                ) {
+                    GuardStmtSyntax(conditions: .expression(ExprSyntax.named(values).dot("count").infix(">", .int(1)))) {
+                        StmtSyntax.return(.named(values))
+                    }
+                    VariableDeclSyntax.binding("seen", nil, ExprSyntax.named("Swift").dot("Set").subscriptedType(Self.int).call(), mutable: true)
+                    StmtSyntax.return(ExprSyntax.named(values).dot("filter").call(trailing: ExprSyntax.closure {
+                        ExprSyntax.named("seen").dot("insert").call(key.map { ExprSyntax.firstArgument.dot($0) } ?? .firstArgument).dot("inserted")
+                    }))
+                }
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("Whether `scalars` has `literal` at `offset`."),
+                modifiers: .static,
+                name: .name("has"),
+                signature: .of([
+                    .parameter(nil, "scalars", .scalars),
+                    .parameter(nil, "offset", Self.int),
+                    .parameter(nil, "literal", Self.uint32.array),
+                ], returning: Self.bool)
+            ) {
+                literalBoundsGuard()
+                ForStmtSyntax(
+                    pattern: indexAndValue,
+                    sequence: ExprSyntax.named("literal").dot("enumerated").call(),
+                    whereClause: WhereClauseSyntax(condition: scalarAtOffsetIndex.dot("value").infix("!=", .named("value")))
+                ) {
+                    StmtSyntax.return(.bool(false))
+                }
+                StmtSyntax.return(.bool(true))
             }
         }
-        """.components(separatedBy: "\n")
+    }
+
+    /// `guard offset + literal.count <= scalars.count else { return false }`.
+    func literalBoundsGuard() -> GuardStmtSyntax {
+        GuardStmtSyntax(conditions: .expression(
+            ExprSyntax.named("offset").infix("+", ExprSyntax.named("literal").dot("count"))
+                .infix("<=", ExprSyntax.named("scalars").dot("count"))
+        )) {
+            StmtSyntax.return(.bool(false))
+        }
+    }
+
+    /// `(index, value)`.
+    var indexAndValue: TuplePatternSyntax {
+        TuplePatternSyntax {
+            TuplePatternElementSyntax(pattern: IdentifierPatternSyntax(identifier: .name("index")))
+            TuplePatternElementSyntax(pattern: IdentifierPatternSyntax(identifier: .name("value")))
+        }
+    }
+
+    /// `scalars[offset + index]`.
+    var scalarAtOffsetIndex: ExprSyntax {
+        ExprSyntax.named("scalars").subscripted(ExprSyntax.named("offset").infix("+", .named("index")))
+    }
+
+    func traceDeclaration() -> ClassDeclSyntax {
+        let trace = TypeSyntax.named("Trace")
+        let symbol = TypeSyntax.named("Symbol")
+        let location = TypeSyntax.named("Location")
+        let parts = TypeSyntax.tuple([("text", Self.string), ("location", location)]).array
+        let fields: [(String, TypeSyntax)] = [("symbol", symbol), ("start", Self.int), ("end", Self.int), ("previous", trace.optional)]
+        return ClassDeclSyntax(
+            leadingTrivia: .documentation(
+                "The matches of referred productions on the way to a step, the",
+                "last first."
+            ),
+            modifiers: [DeclModifierSyntax(name: .keyword(.final))],
+            name: .name("Trace"),
+            inheritanceClause: .swift("Sendable")
+        ) {
+            for (name, type) in fields { VariableDeclSyntax.binding(name, type) }
+            InitializerDeclSyntax(signature: .of(fields.map { .parameter(nil, $0.0, $0.1) })) {
+                for (name, _) in fields {
+                    ExprSyntax(MemberAccessExprSyntax(base: DeclReferenceExprSyntax(baseName: .keyword(.self)), declName: DeclReferenceExprSyntax(baseName: .name(name))))
+                        .assigned(.named(name))
+                }
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation(
+                    "The text and location of each match of `symbol` in",
+                    "`scalars`, which start at `location`, in document order."
+                ),
+                name: .name("parts"),
+                signature: .of([
+                    .parameter(nil, "symbol", symbol),
+                    .parameter("in", "scalars", .scalars),
+                    .parameter("at", "location", location),
+                ], returning: parts)
+            ) {
+                VariableDeclSyntax.binding("matches", trace.array, .array([]), mutable: true)
+                VariableDeclSyntax.binding("trace", trace.optional, ExprSyntax(DeclReferenceExprSyntax(baseName: .keyword(.self))), mutable: true)
+                WhileStmtSyntax(conditions: [.binding("current", .named("trace"))]) {
+                    IfExprSyntax(conditions: .expression(ExprSyntax.named("current").dot("symbol").infix("==", .named("symbol")))) {
+                        ExprSyntax.named("matches").dot("append").call(.named("current"))
+                    }
+                    ExprSyntax.named("trace").assigned(ExprSyntax.named("current").dot("previous"))
+                }
+                let match = ExprSyntax.firstArgument
+                let text = Self.text(of: ExprSyntax.named("scalars").subscripted(match.dot("start").infix("..<", match.dot("end"))))
+                let start = ExprSyntax.named("location").dot("advanced").call(labeled: [
+                    ("over", ExprSyntax.named("scalars").subscripted(ExprSyntax.int(0).infix("..<", match.dot("start")))),
+                ])
+                StmtSyntax.return(ExprSyntax.named("matches").dot("reversed").call().dot("map").call(trailing: ExprSyntax.closure {
+                    ExprSyntax.tuple([(nil, text), (nil, start)])
+                }))
+            }
+        }
+    }
+
+    /// `Swift.String(Swift.String.UnicodeScalarView(scalars))`.
+    static func text(of scalars: ExprSyntax) -> ExprSyntax {
+        let string = ExprSyntax.named("Swift").dot("String")
+        return string.call(string.dot("UnicodeScalarView").call(scalars))
     }
 
     // MARK: - Terminals
 
-    func terminalDeclaration(_ production: Production) throws(TranslationError) -> [String] {
+    func terminalDeclaration(_ production: Production) throws(TranslationError) -> ExtensionDeclSyntax {
         let type = SwiftName.type(production.symbol)
         var emitter = MatcherEmitter(bySymbol: bySymbol, firstCharacters: firstCharacters)
         // A regular production is matched by its automaton; one that refers
         // back to itself, by following the positions its expression reaches.
-        let endsBody: [String]
+        let endsBody: CodeBlockItemListSyntax
         if let automaton = Automaton(production.expression, bySymbol: bySymbol) {
             endsBody = Self.automatonBody(automaton)
         } else {
-            endsBody = try emitter.function(for: production.expression, mode: .ends)
+            endsBody = try emitter.body(for: production.expression, mode: .ends)
         }
         let direct = Self.directSymbols(production.expression)
-        let stepsBody = direct.isEmpty ? [] : try emitter.function(for: production.expression, mode: .steps)
-        var lines: [String] = []
-        lines.append("extension \(namespace) {")
-        lines.append("    /// `\(production.symbol) ::= \(production.expression.notation)`")
-        lines.append("    struct \(type): Swift.Sendable, Swift.Hashable {")
-        lines.append("        /// The text the production matched.")
-        lines.append("        let text: Swift.String")
-        lines.append("        /// Where the text starts.")
-        lines.append("        let location: Location")
-        lines.append("")
-        lines.append("        init(text: Swift.String, location: Location) {")
-        lines.append("            self.text = text")
-        lines.append("            self.location = location")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        /// `text` as a match of the production, when all of it matches.")
-        lines.append("        init?(parsing text: Swift.String) {")
-        lines.append("            guard Self.matches(text) else { return nil }")
-        lines.append("            self.init(text: text, location: .start)")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        /// Whether all of `text` matches the production.")
-        lines.append("        static func matches(_ text: Swift.String) -> Swift.Bool {")
-        lines.append("            let scalars = Swift.Array(text.unicodeScalars)")
-        lines.append("            return ends(scalars, 0).contains(scalars.count)")
-        lines.append("        }")
-        lines.append("")
+        let stepsBody = direct.isEmpty ? nil : try emitter.body(for: production.expression, mode: .steps)
         let first = firstCharacters[production.symbol] ?? .unknown
-        lines.append("        /// Whether a match of the production can start with the character")
-        lines.append("        /// `value`.")
-        lines.append("        static func starts(_ value: Swift.UInt32) -> Swift.Bool {")
-        if first.isUnbounded {
-            lines.append("            true")
+        let location = TypeSyntax.named("Location")
+        let text = ExprSyntax.named("text")
+        let scalarsOfText = ExprSyntax.named("Swift").dot("Array").call(text.dot("unicodeScalars"))
+        let characters: [FunctionParameterSyntax] = [.parameter(nil, "s", .scalars), .parameter(nil, "offset", Self.int)]
+
+        let members = MemberBlockItemListSyntax {
+            VariableDeclSyntax.binding("text", Self.string, leadingTrivia: .documentation("The text the production matched."))
+            VariableDeclSyntax.binding("location", location, leadingTrivia: .documentation("Where the text starts."))
+            InitializerDeclSyntax(signature: .of([.parameter("text", "text", Self.string), .parameter("location", "location", location)])) {
+                ExprSyntax(MemberAccessExprSyntax(base: DeclReferenceExprSyntax(baseName: .keyword(.self)), declName: DeclReferenceExprSyntax(baseName: .name("text")))).assigned(text)
+                ExprSyntax(MemberAccessExprSyntax(base: DeclReferenceExprSyntax(baseName: .keyword(.self)), declName: DeclReferenceExprSyntax(baseName: .name("location")))).assigned(.named("location"))
+            }
+            InitializerDeclSyntax(
+                leadingTrivia: .documentation("`text` as a match of the production, when all of it matches."),
+                optionalMark: .postfixQuestionMarkToken(),
+                signature: .of([.parameter("parsing", "text", Self.string)])
+            ) {
+                GuardStmtSyntax(conditions: .expression(ExprSyntax.selfType.dot("matches").call(text))) {
+                    StmtSyntax.return(.nil)
+                }
+                ExprSyntax(MemberAccessExprSyntax(base: DeclReferenceExprSyntax(baseName: .keyword(.self)), declName: DeclReferenceExprSyntax(baseName: .keyword(.`init`))))
+                    .call(labeled: [("text", text), ("location", .dot("start"))])
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("Whether all of `text` matches the production."),
+                modifiers: .static,
+                name: .name("matches"),
+                signature: .of([.parameter(nil, "text", Self.string)], returning: Self.bool)
+            ) {
+                VariableDeclSyntax.binding("scalars", nil, scalarsOfText)
+                StmtSyntax.return(ExprSyntax.named("ends").call(.named("scalars"), .int(0)).dot("contains").call(ExprSyntax.named("scalars").dot("count")))
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("Whether a match of the production can start with the character", "`value`."),
+                modifiers: .static,
+                name: .name("starts"),
+                signature: .of([.parameter(nil, "value", Self.uint32)], returning: Self.bool)
+            ) {
+                Self.startsBody(first)
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("The end of the longest match of the production at `offset`."),
+                modifiers: .static,
+                name: .name("longestMatch"),
+                signature: .of([.parameter("in", "scalars", .scalars), .parameter("at", "offset", Self.int)], returning: Self.int.optional)
+            ) {
+                StmtSyntax.return(ExprSyntax.named("ends").call(.named("scalars"), .named("offset")).dot("max").call())
+            }
+            if !direct.isEmpty {
+                VariableDeclSyntax.computed(
+                    "trace", TypeSyntax.named("Trace").optional,
+                    modifiers: .private,
+                    leadingTrivia: .documentation("The trace of the productions the text matched on the way.")
+                ) {
+                    VariableDeclSyntax.binding("scalars", nil, scalarsOfText)
+                    StmtSyntax.return(
+                        ExprSyntax.selfType.dot("match").call(.named("scalars"), .int(0)).dot("first")
+                            .call(trailing: ExprSyntax.closure { ExprSyntax.firstArgument.dot("end").infix("==", ExprSyntax.named("scalars").dot("count")) })
+                            .chained.dot("trace")
+                    )
+                }
+                for symbol in direct {
+                    if let member = partMember(symbol, in: production.expression) { member }
+                }
+            }
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("The ends of the matches of the production from `offset`."),
+                modifiers: .static,
+                name: .name("ends"),
+                signature: .of(characters, returning: Self.int.array)
+            ) {
+                endsBody
+            }
+            if let stepsBody {
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation(
+                        "The matches of the production from `offset`, each with where the",
+                        "productions it refers to matched on the way."
+                    ),
+                    modifiers: .static,
+                    name: .name("match"),
+                    signature: .of(characters, returning: TypeSyntax.named("Step").array)
+                ) {
+                    stepsBody
+                }
+            }
+            for (index, string) in emitter.strings.enumerated() {
+                VariableDeclSyntax.binding("string" + String(index), Self.uint32.array, .array(string.map(ExprSyntax.codePoint)), modifiers: .static)
+            }
+            for (index, characterClass) in emitter.classes.enumerated() {
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation("`\(Expression.characterClass(characterClass).notation)`"),
+                    modifiers: .static,
+                    name: .name("class" + String(index)),
+                    signature: .of([.parameter(nil, "value", Self.uint32)], returning: Self.bool)
+                ) {
+                    if characterClass.ranges.isEmpty {
+                        StmtSyntax.return(.bool(characterClass.isNegated))
+                    } else {
+                        SwitchExprSyntax(subject: ExprSyntax.named("value")) {
+                            SwitchCaseSyntax.matching(characterClass.ranges.map(ExprSyntax.codePoints)) {
+                                StmtSyntax.return(.bool(!characterClass.isNegated))
+                            }
+                            SwitchCaseSyntax.otherwise {
+                                StmtSyntax.return(.bool(characterClass.isNegated))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return ExtensionDeclSyntax(extendedType: namespaceType) {
+            StructDeclSyntax(
+                leadingTrivia: .documentation("`\(production.symbol) ::= \(production.expression.notation)`"),
+                name: .name(type),
+                inheritanceClause: .swift("Sendable", "Hashable"),
+                memberBlock: MemberBlockSyntax(members: members)
+            )
+        }
+    }
+
+    /// The member of a terminal's struct that holds the parts of its text
+    /// `symbol` matched, `nil` when its expression never holds one.
+    func partMember(_ symbol: String, in expression: Expression) -> VariableDeclSyntax? {
+        let count = Self.occurrences(of: symbol, in: expression)
+        guard count.max > 0 else { return nil }
+        let part = SwiftName.type(symbol)
+        let match = ExprSyntax.firstArgument
+        let all = ExprSyntax.named("trace").chained.dot("parts").call(labeled: [
+            (nil, .dot(part)),
+            ("in", ExprSyntax.named("Swift").dot("Array").call(ExprSyntax.named("text").dot("unicodeScalars"))),
+            ("at", .named("location")),
+        ]).infix("??", .array([])).parenthesized.dot("map").call(trailing: ExprSyntax.closure {
+            ExprSyntax.named(part).call(labeled: [("text", match.dot("text")), ("location", match.dot("location"))])
+        })
+        let member: String
+        let type: TypeSyntax
+        let value: ExprSyntax
+        let documentation: Trivia
+        if count.max == 1 && count.min == 1 {
+            member = SwiftName.member(symbol)
+            type = .named(part)
+            value = all.subscripted(.int(0))
+            documentation = .documentation("The `\(symbol)` the text holds.")
+        } else if count.max == 1 {
+            member = SwiftName.member(symbol)
+            type = TypeSyntax.named(part).optional
+            value = all.dot("first")
+            documentation = .documentation("The `\(symbol)` the text holds, if any.")
         } else {
-            let positive = first.classes.filter { !$0.isNegated }.flatMap(\.ranges)
-            let negative = first.classes.filter(\.isNegated)
-            var tests: [String] = []
+            member = SwiftName.plural(SwiftName.member(symbol))
+            type = TypeSyntax.named(part).array
+            value = all
+            documentation = .documentation("The `\(symbol)`s the text holds, in order.")
+        }
+        let canBeAbsent = count.min == 0 && firstCharacters[symbol]?.mustAlwaysTry == false
+        return VariableDeclSyntax.computed(member, type, leadingTrivia: documentation) {
+            if canBeAbsent {
+                // No character of the text can start one: none is there.
+                GuardStmtSyntax(conditions: .expression(
+                    ExprSyntax.named("text").dot("unicodeScalars").dot("contains")
+                        .call(labeled: [("where", ExprSyntax(ExprSyntax.closure {
+                            ExprSyntax.named(part).dot("starts").call(ExprSyntax.firstArgument.dot("value"))
+                        }))])
+                )) {
+                    StmtSyntax.return(count.max == 1 ? .nil : .array([]))
+                }
+            }
+            StmtSyntax.return(value)
+        }
+    }
+
+    /// The body of `starts(_:)`: whether `value` is in one of the classes a
+    /// match can start with.
+    static func startsBody(_ first: FirstCharacters) -> CodeBlockItemListSyntax {
+        guard !first.isUnbounded else { return [CodeBlockItemSyntax(item: .stmt(.return(.bool(true))))] }
+        let positive = first.classes.filter { !$0.isNegated }.flatMap(\.ranges)
+        let negative = first.classes.filter(\.isNegated)
+        return CodeBlockItemListSyntax {
             if !positive.isEmpty {
-                tests.append("{ switch value { case \(positive.map(Self.range).joined(separator: ", ")): return true; default: return false } }()")
+                SwitchExprSyntax(subject: ExprSyntax.named("value")) {
+                    SwitchCaseSyntax.matching(positive.map(ExprSyntax.codePoints)) { StmtSyntax.return(.bool(true)) }
+                    SwitchCaseSyntax.otherwise { StmtSyntax.break }
+                }
             }
             for characterClass in negative {
-                tests.append("{ switch value { case \(characterClass.ranges.map(Self.range).joined(separator: ", ")): return false; default: return true } }()")
-            }
-            lines.append("            " + (tests.isEmpty ? "false" : tests.joined(separator: " || ")))
-        }
-        lines.append("        }")
-        lines.append("")
-        lines.append("        /// The end of the longest match of the production at `offset`.")
-        lines.append("        static func longestMatch(in scalars: [Swift.Unicode.Scalar], at offset: Swift.Int) -> Swift.Int? {")
-        lines.append("            ends(scalars, offset).max()")
-        lines.append("        }")
-
-        if !direct.isEmpty {
-            lines.append("")
-            lines.append("        /// The trace of the productions the text matched on the way.")
-            lines.append("        private var trace: Trace? {")
-            lines.append("            let scalars = Swift.Array(text.unicodeScalars)")
-            lines.append("            return Self.match(scalars, 0).first { $0.end == scalars.count }?.trace")
-            lines.append("        }")
-            for symbol in direct {
-                let count = Self.occurrences(of: symbol, in: production.expression)
-                guard count.max > 0 else { continue }
-                let part = SwiftName.type(symbol)
-                lines.append("")
-                let member: String
-                let returnType: String
-                let expression: String
-                let all = "(trace?.parts(.\(part), in: Swift.Array(text.unicodeScalars), at: location) ?? []).map { \(part)(text: $0.text, location: $0.location) }"
-                if count.max == 1 && count.min == 1 {
-                    member = SwiftName.member(symbol)
-                    returnType = part
-                    expression = "\(all)[0]"
-                    lines.append("        /// The `\(symbol)` the text holds.")
-                } else if count.max == 1 {
-                    member = SwiftName.member(symbol)
-                    returnType = part + "?"
-                    expression = "\(all).first"
-                    lines.append("        /// The `\(symbol)` the text holds, if any.")
+                if characterClass.ranges.isEmpty {
+                    StmtSyntax.return(.bool(true))
                 } else {
-                    member = SwiftName.plural(SwiftName.member(symbol))
-                    returnType = "[\(part)]"
-                    expression = all
-                    lines.append("        /// The `\(symbol)`s the text holds, in order.")
+                    SwitchExprSyntax(subject: ExprSyntax.named("value")) {
+                        SwitchCaseSyntax.matching(characterClass.ranges.map(ExprSyntax.codePoints)) { StmtSyntax.break }
+                        SwitchCaseSyntax.otherwise { StmtSyntax.return(.bool(true)) }
+                    }
                 }
-                lines.append("        var \(member): \(returnType) {")
-                if count.min == 0, firstCharacters[symbol]?.mustAlwaysTry == false {
-                    // No character of the text can start one: none is there.
-                    lines.append("            guard text.unicodeScalars.contains(where: { \(part).starts($0.value) }) else { return \(count.max == 1 ? "nil" : "[]") }")
-                    lines.append("            return \(expression)")
-                } else {
-                    lines.append("            \(expression)")
-                }
-                lines.append("        }")
             }
+            StmtSyntax.return(.bool(false))
         }
-        lines.append("")
-        lines.append("        /// The ends of the matches of the production from `offset`.")
-        lines.append("        static func ends(_ s: [Swift.Unicode.Scalar], _ offset: Swift.Int) -> [Swift.Int] {")
-        lines.append(contentsOf: endsBody.map { "            " + $0 })
-        lines.append("        }")
-        if !stepsBody.isEmpty {
-            lines.append("")
-            lines.append("        /// The matches of the production from `offset`, each with where the")
-            lines.append("        /// productions it refers to matched on the way.")
-            lines.append("        static func match(_ s: [Swift.Unicode.Scalar], _ offset: Swift.Int) -> [Step] {")
-            lines.append(contentsOf: stepsBody.map { "            " + $0 })
-            lines.append("        }")
-        }
-        for (index, string) in emitter.strings.enumerated() {
-            lines.append("")
-            lines.append("        static let string\(index): [Swift.UInt32] = [\(string.map(Self.hex).joined(separator: ", "))]")
-        }
-        for (index, characterClass) in emitter.classes.enumerated() {
-            lines.append("")
-            lines.append("        /// `\(Expression.characterClass(characterClass).notation)`")
-            lines.append("        static func class\(index)(_ value: Swift.UInt32) -> Swift.Bool {")
-            let ranges = characterClass.ranges.map { range in
-                range.lowerBound == range.upperBound ? Self.hex(range.lowerBound) : Self.hex(range.lowerBound) + "..." + Self.hex(range.upperBound)
-            }
-            lines.append("            switch value {")
-            lines.append("            case \(ranges.joined(separator: ", ")): return \(!characterClass.isNegated)")
-            lines.append("            default: return \(characterClass.isNegated)")
-            lines.append("            }")
-            lines.append("        }")
-        }
-        lines.append("    }")
-        lines.append("}")
-        return lines
     }
 
     /// The body of `ends(_:_:)` for a production matched by `automaton`:
     /// it reads the characters from `offset` and records each position where
     /// the automaton accepts.
-    static func automatonBody(_ automaton: Automaton) -> [String] {
-        var lines = ["var ends: [Swift.Int] = []", "var state = 0", "var index = offset", "while true {"]
+    static func automatonBody(_ automaton: Automaton) -> CodeBlockItemListSyntax {
         let accepting = automaton.accepting.indices.filter { automaton.accepting[$0] }
-        if !accepting.isEmpty {
-            lines.append("    switch state {")
-            lines.append("    case \(accepting.map(String.init).joined(separator: ", ")): ends.append(index)")
-            lines.append("    default: break")
-            lines.append("    }")
-        }
-        lines.append("    guard index < s.count else { return ends }")
-        lines.append("    let value = s[index].value")
-        lines.append("    switch state {")
-        for (state, row) in automaton.transitions.enumerated() where !row.isEmpty {
-            lines.append("    case \(state):")
-            lines.append("        switch value {")
-            var targets: [Int] = []
-            for transition in row where !targets.contains(transition.target) { targets.append(transition.target) }
-            for target in targets {
-                let ranges = row.filter { $0.target == target }.map { range($0.range) }
-                lines.append("        case \(ranges.joined(separator: ", ")): state = \(target)")
+        let state = ExprSyntax.named("state")
+        return CodeBlockItemListSyntax {
+            VariableDeclSyntax.binding("ends", int.array, .array([]), mutable: true)
+            VariableDeclSyntax.binding("state", nil, .int(0), mutable: true)
+            VariableDeclSyntax.binding("index", nil, .named("offset"), mutable: true)
+            WhileStmtSyntax(conditions: .expression(.bool(true))) {
+                if !accepting.isEmpty {
+                    SwitchExprSyntax(subject: state) {
+                        SwitchCaseSyntax.matching(accepting.map(ExprSyntax.int)) {
+                            ExprSyntax.named("ends").dot("append").call(.named("index"))
+                        }
+                        SwitchCaseSyntax.otherwise { StmtSyntax.break }
+                    }
+                }
+                GuardStmtSyntax(conditions: .expression(ExprSyntax.named("index").infix("<", ExprSyntax.named("s").dot("count")))) {
+                    StmtSyntax.return(.named("ends"))
+                }
+                VariableDeclSyntax.binding("value", nil, ExprSyntax.named("s").subscripted(.named("index")).dot("value"))
+                SwitchExprSyntax(subject: state) {
+                    for (index, row) in automaton.transitions.enumerated() where !row.isEmpty {
+                        SwitchCaseSyntax.matching([.int(index)]) {
+                            SwitchExprSyntax(subject: ExprSyntax.named("value")) {
+                                for target in Self.targets(row) {
+                                    SwitchCaseSyntax.matching(row.filter { $0.target == target }.map { ExprSyntax.codePoints($0.range) }) {
+                                        state.assigned(.int(target))
+                                    }
+                                }
+                                SwitchCaseSyntax.otherwise { StmtSyntax.return(.named("ends")) }
+                            }
+                        }
+                    }
+                    SwitchCaseSyntax.otherwise { StmtSyntax.return(.named("ends")) }
+                }
+                ExprSyntax.named("index").infix("+=", .int(1))
             }
-            lines.append("        default: return ends")
-            lines.append("        }")
         }
-        lines.append("    default: return ends")
-        lines.append("    }")
-        lines.append("    index += 1")
-        lines.append("}")
-        return lines
     }
 
-    static func range(_ range: ClosedRange<UInt32>) -> String {
-        range.lowerBound == range.upperBound ? hex(range.lowerBound) : hex(range.lowerBound) + "..." + hex(range.upperBound)
-    }
-
-    static func hex(_ value: UInt32) -> String {
-        "0x" + String(value, radix: 16, uppercase: true)
+    /// The states `row` leads to, in order of first appearance.
+    static func targets(_ row: [Automaton.Transition]) -> [Int] {
+        var targets: [Int] = []
+        for transition in row where !targets.contains(transition.target) { targets.append(transition.target) }
+        return targets
     }
 
     /// The symbols an expression refers to outside the right side of a
@@ -563,150 +783,236 @@ private struct Translation {
 
     // MARK: - Tokens
 
-    func tokenDeclarations() -> [String] {
-        var lines: [String] = []
-        lines.append("extension \(namespace) {")
-        lines.append("    /// A terminal or string of the productions read over terminals.")
-        lines.append("    enum Kind: Swift.Sendable, Swift.Hashable {")
-        if !lexerTerminals.isEmpty {
-            lines.append("        case \(lexerTerminals.map(SwiftName.type).joined(separator: ", "))")
-        }
-        lines.append("        /// The string at this index of `Lexer.literals`.")
-        lines.append("        case literal(Swift.Int)")
-        lines.append("    }")
-        lines.append("")
-        lines.append("    /// A terminal or string read from a document.")
-        lines.append("    struct Token: Swift.Sendable {")
-        lines.append("        let kind: Kind")
-        lines.append("        let text: Swift.String")
-        lines.append("        let location: Location")
-        lines.append("    }")
-        lines.append("")
-        lines.append("    /// Splits a document into tokens, the longest match at each")
-        lines.append("    /// position, after what `\(namespace).trivia(_:from:)` skips.")
-        lines.append("    enum Lexer {")
-        lines.append("        /// The strings of the productions read over terminals, with")
-        lines.append("        /// whether each matches without regard to case.")
-        lines.append("        static let literals: [(text: Swift.String, scalars: [Swift.UInt32], caseInsensitive: Swift.Bool)] = [")
-        for literal in literals {
-            let scalars = literal.text.unicodeScalars.map { Self.hex($0.value) }.joined(separator: ", ")
-            lines.append("            (\(Self.stringLiteral(literal.text)), [\(scalars)], \(literal.caseInsensitive)),")
-        }
-        lines.append("        ]")
-        lines.append("")
-        lines.append("        static func tokens(in s: [Swift.Unicode.Scalar]) throws(SyntaxError) -> (tokens: [Token], end: Location) {")
-        lines.append("            var tokens: [Token] = []")
-        lines.append("            var offset = 0")
-        lines.append("            var location = Location.start")
-        lines.append("            while true {")
-        lines.append("                let next = \(namespace).trivia(s, from: offset)")
-        lines.append("                location = location.advanced(over: s[offset..<next])")
-        lines.append("                offset = next")
-        lines.append("                guard offset < s.count else { return (tokens, location) }")
-        lines.append("                var end = offset")
-        lines.append("                var kind: Kind?")
-        lines.append("                for (index, literal) in literals.enumerated() where offset + literal.scalars.count > end && has(s, offset, literal.scalars, literal.caseInsensitive) {")
-        lines.append("                    end = offset + literal.scalars.count")
-        lines.append("                    kind = .literal(index)")
-        lines.append("                }")
-        for terminal in lexerTerminals {
-            let type = SwiftName.type(terminal)
-            let filter = firstCharacters[terminal]?.mustAlwaysTry == false ? "\(type).starts(s[offset].value), " : ""
-            lines.append("                if \(filter)let match = \(type).longestMatch(in: s, at: offset), match > end {")
-            lines.append("                    end = match")
-            lines.append("                    kind = .\(type)")
-            lines.append("                }")
-        }
-        lines.append("                guard let kind else {")
-        lines.append("                    throw SyntaxError(location: location, message: \"unexpected character U+\" + Swift.String(s[offset].value, radix: 16, uppercase: true))")
-        lines.append("                }")
-        lines.append("                let text = Swift.String(Swift.String.UnicodeScalarView(s[offset..<end]))")
-        lines.append("                tokens.append(Token(kind: kind, text: text, location: location))")
-        lines.append("                location = location.advanced(over: s[offset..<end])")
-        lines.append("                offset = end")
-        lines.append("            }")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        /// Whether `scalars` has `literal` at `offset`.")
-        lines.append("        static func has(_ scalars: [Swift.Unicode.Scalar], _ offset: Swift.Int, _ literal: [Swift.UInt32], _ caseInsensitive: Swift.Bool) -> Swift.Bool {")
-        lines.append("            guard offset + literal.count <= scalars.count else { return false }")
-        lines.append("            for (index, value) in literal.enumerated() where scalars[offset + index].value != value {")
-        lines.append("                guard caseInsensitive, let expected = Swift.Unicode.Scalar(value),")
-        lines.append("                      Swift.String(scalars[offset + index]).lowercased() == Swift.String(expected).lowercased() else { return false }")
-        lines.append("            }")
-        lines.append("            return true")
-        lines.append("        }")
-        lines.append("    }")
-        lines.append("")
-        lines.append("    /// Reads `text` as the production `read` reads.")
-        lines.append("    static func parse<Node>(_ text: Swift.String, _ read: (inout Parser) -> Node?) throws(SyntaxError) -> Node {")
-        lines.append("        let lexed = try Lexer.tokens(in: Swift.Array(text.unicodeScalars))")
-        lines.append("        var parser = Parser(tokens: lexed.tokens, end: lexed.end)")
-        lines.append("        if let node = read(&parser), parser.index == lexed.tokens.count { return node }")
-        lines.append("        parser.expectEnd()")
-        lines.append("        throw parser.failure()")
-        lines.append("    }")
-        lines.append("}")
-        return lines
-    }
-
-    static func stringLiteral(_ text: String) -> String {
-        var result = "\""
-        for scalar in text.unicodeScalars {
-            switch scalar {
-            case "\\": result += "\\\\"
-            case "\"": result += "\\\""
-            case " "..."~": result.unicodeScalars.append(scalar)
-            default: result += "\\u{\(String(scalar.value, radix: 16, uppercase: true))}"
+    /// `Kind`, `Token` and `Lexer`.
+    func tokenDeclarations() -> ExtensionDeclSyntax {
+        let kind = TypeSyntax.named("Kind")
+        let token = TypeSyntax.named("Token")
+        let location = TypeSyntax.named("Location")
+        let s = ExprSyntax.named("s")
+        let offset = ExprSyntax.named("offset")
+        let end = ExprSyntax.named("end")
+        let span = s.subscripted(offset.infix("..<", end))
+        return ExtensionDeclSyntax(extendedType: namespaceType) {
+            EnumDeclSyntax(
+                leadingTrivia: .documentation("A terminal or string of the productions read over terminals."),
+                name: .name("Kind"),
+                inheritanceClause: .swift("Sendable", "Hashable")
+            ) {
+                if !lexerTerminals.isEmpty {
+                    EnumCaseDeclSyntax {
+                        for terminal in lexerTerminals { EnumCaseElementSyntax(name: .name(SwiftName.type(terminal))) }
+                    }
+                }
+                EnumCaseDeclSyntax(leadingTrivia: .documentation("The string at this index of `Lexer.literals`.")) {
+                    EnumCaseElementSyntax(name: .name("literal"), parameterClause: EnumCaseParameterClauseSyntax(parameters: [EnumCaseParameterSyntax(type: Self.int)]))
+                }
+            }
+            StructDeclSyntax(
+                leadingTrivia: .documentation("A terminal or string read from a document."),
+                name: .name("Token"),
+                inheritanceClause: .swift("Sendable")
+            ) {
+                VariableDeclSyntax.binding("kind", kind)
+                VariableDeclSyntax.binding("text", Self.string)
+                VariableDeclSyntax.binding("location", location)
+            }
+            EnumDeclSyntax(
+                leadingTrivia: .documentation(
+                    "Splits a document into tokens, the longest match at each",
+                    "position, after what `\(namespace).trivia(_:from:)` skips."
+                ),
+                name: .name("Lexer")
+            ) {
+                VariableDeclSyntax.binding(
+                    "literals", Self.string.array, ExprSyntax(literal: literals.map(\.text)),
+                    modifiers: .static,
+                    leadingTrivia: .documentation("The strings of the productions read over terminals.")
+                )
+                VariableDeclSyntax.binding(
+                    "literalScalars", Self.uint32.array.array, .array(literals.map { .array($0.text.unicodeScalars.map { .codePoint($0.value) }) }),
+                    modifiers: .static,
+                    leadingTrivia: .documentation("The code points of each string.")
+                )
+                VariableDeclSyntax.binding(
+                    "caseInsensitive", Self.bool.array, .array(literals.map { .bool($0.caseInsensitive) }),
+                    modifiers: .static,
+                    leadingTrivia: .documentation("Whether each string matches without regard to case.")
+                )
+                FunctionDeclSyntax(
+                    modifiers: .static,
+                    name: .name("tokens"),
+                    signature: .of(
+                        [.parameter("in", "s", .scalars)],
+                        returning: .tuple([("tokens", token.array), ("end", location)]),
+                        throwing: .named("SyntaxError")
+                    )
+                ) {
+                    VariableDeclSyntax.binding("tokens", token.array, .array([]), mutable: true)
+                    VariableDeclSyntax.binding("offset", nil, .int(0), mutable: true)
+                    VariableDeclSyntax.binding("location", nil, ExprSyntax.named("Location").dot("start"), mutable: true)
+                    WhileStmtSyntax(conditions: .expression(.bool(true))) {
+                        VariableDeclSyntax.binding("next", nil, ExprSyntax.named(namespace).dot("trivia").call(labeled: [(nil, s), ("from", offset)]))
+                        ExprSyntax.named("location").assigned(ExprSyntax.named("location").dot("advanced").call(labeled: [("over", s.subscripted(offset.infix("..<", .named("next"))))]))
+                        offset.assigned(.named("next"))
+                        GuardStmtSyntax(conditions: .expression(offset.infix("<", s.dot("count")))) {
+                            StmtSyntax.return(.tuple([(nil, .named("tokens")), (nil, .named("location"))]))
+                        }
+                        VariableDeclSyntax.binding("end", nil, offset, mutable: true)
+                        VariableDeclSyntax.binding("kind", kind.optional, mutable: true)
+                        let scalars = ExprSyntax.named("literalScalars").subscripted(.named("index"))
+                        ForStmtSyntax(
+                            pattern: IdentifierPatternSyntax(identifier: .name("index")),
+                            sequence: ExprSyntax.named("literals").dot("indices"),
+                            whereClause: WhereClauseSyntax(condition: offset.infix("+", scalars.dot("count")).infix(">", end).infix(
+                                "&&",
+                                ExprSyntax.named("has").call(s, offset, scalars, ExprSyntax.named("caseInsensitive").subscripted(.named("index")))
+                            ))
+                        ) {
+                            end.assigned(offset.infix("+", scalars.dot("count")))
+                            ExprSyntax.named("kind").assigned(ExprSyntax.dot("literal").call(.named("index")))
+                        }
+                        for terminal in lexerTerminals {
+                            let type = ExprSyntax.named(SwiftName.type(terminal))
+                            IfExprSyntax(conditions: ConditionElementListSyntax {
+                                if firstCharacters[terminal]?.mustAlwaysTry == false {
+                                    ConditionElementSyntax.expression(type.dot("starts").call(s.subscripted(offset).dot("value")))
+                                }
+                                ConditionElementSyntax.binding("match", type.dot("longestMatch").call(labeled: [("in", s), ("at", offset)]))
+                                ConditionElementSyntax.expression(ExprSyntax.named("match").infix(">", end))
+                            }) {
+                                end.assigned(.named("match"))
+                                ExprSyntax.named("kind").assigned(.dot(SwiftName.type(terminal)))
+                            }
+                        }
+                        GuardStmtSyntax(conditions: [.binding("kind")]) {
+                            StmtSyntax.throw(ExprSyntax.named("SyntaxError").call(labeled: [
+                                ("location", .named("location")),
+                                ("message", ExprSyntax.string("unexpected character U+").infix("+", ExprSyntax.named("Swift").dot("String").call(labeled: [
+                                    (nil, s.subscripted(offset).dot("value")), ("radix", .int(16)), ("uppercase", .bool(true)),
+                                ]))),
+                            ]))
+                        }
+                        ExprSyntax.named("tokens").dot("append").call(ExprSyntax.named("Token").call(labeled: [
+                            ("kind", .named("kind")), ("text", Self.text(of: span)), ("location", .named("location")),
+                        ]))
+                        ExprSyntax.named("location").assigned(ExprSyntax.named("location").dot("advanced").call(labeled: [("over", span)]))
+                        offset.assigned(end)
+                    }
+                }
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation("Whether `scalars` has `literal` at `offset`, without regard to case when `caseInsensitive`."),
+                    modifiers: .static,
+                    name: .name("has"),
+                    signature: .of([
+                        .parameter(nil, "scalars", .scalars),
+                        .parameter(nil, "offset", Self.int),
+                        .parameter(nil, "literal", Self.uint32.array),
+                        .parameter(nil, "caseInsensitive", Self.bool),
+                    ], returning: Self.bool)
+                ) {
+                    literalBoundsGuard()
+                    ForStmtSyntax(
+                        pattern: indexAndValue,
+                        sequence: ExprSyntax.named("literal").dot("enumerated").call(),
+                        whereClause: WhereClauseSyntax(condition: scalarAtOffsetIndex.dot("value").infix("!=", .named("value")))
+                    ) {
+                        let lowercased = { (scalar: ExprSyntax) in ExprSyntax.named("Swift").dot("String").call(scalar).dot("lowercased").call() }
+                        GuardStmtSyntax(conditions: ConditionElementListSyntax {
+                            ConditionElementSyntax.expression(.named("caseInsensitive"))
+                            ConditionElementSyntax.binding("expected", ExprSyntax.named("Swift").dot("Unicode").dot("Scalar").call(.named("value")))
+                            ConditionElementSyntax.expression(lowercased(scalarAtOffsetIndex).infix("==", lowercased(.named("expected"))))
+                        }) {
+                            StmtSyntax.return(.bool(false))
+                        }
+                    }
+                    StmtSyntax.return(.bool(true))
+                }
             }
         }
-        return result + "\""
     }
 
     // MARK: - Productions read over terminals
 
-    mutating func nodeDeclaration(_ production: Production) throws(TranslationError) -> [String] {
+    mutating func nodeDeclaration(_ production: Production) throws(TranslationError) -> [DeclSyntax] {
         let type = SwiftName.type(production.symbol)
-        var lines: [String] = [""]
-        lines.append("extension \(namespace) {")
-        lines.append("    /// `\(production.symbol) ::= \(production.expression.notation)`")
+        let documentation = Trivia.documentation("`\(production.symbol) ::= \(production.expression.notation)`")
+        let declaration: DeclSyntax
         if case .choice(let options) = production.expression {
             let cases = try compileCases(options, owner: type)
-            lines.append("    indirect enum \(type): Swift.Sendable {")
-            lines.append(contentsOf: cases.declarations.map { "        " + $0 })
-            lines.append("    }")
-            parserMethods.append(contentsOf: choiceMethod(name: "parse\(type)", type: type, cases: cases.compiled))
+            declaration = DeclSyntax(Self.enumDeclaration(type, cases: cases, leadingTrivia: documentation))
+            parserMethods.append(choiceMethod(name: "parse" + type, type: .named(type), options: options, cases: cases))
         } else {
             let items: [Expression]
             if case .sequence(let parts) = production.expression { items = parts } else { items = [production.expression] }
             var compiled: [Compiled] = []
             for item in items { compiled.append(try compile(item, owner: type)) }
             let fields = Self.uniqueNames(compiled.compactMap(\.part))
-            lines.append("    final class \(type): Swift.Sendable {")
-            for field in fields {
-                lines.append("        let \(field.name): \(field.type)")
-            }
-            lines.append("")
-            let parameters = fields.map { "\($0.name): \($0.type)" }.joined(separator: ", ")
-            lines.append("        init(\(parameters)) {")
-            for field in fields {
-                lines.append("            self.\(field.name) = \(field.name)")
-            }
-            lines.append("        }")
-            lines.append("    }")
-            parserMethods.append(contentsOf: sequenceMethod(name: "parse\(type)", type: type, items: compiled, fieldNames: fields.map(\.name), construct: { values in
-                "\(type)(" + zip(fields, values).map { "\($0.name): \($1)" }.joined(separator: ", ") + ")"
-            }))
+            declaration = DeclSyntax(ClassDeclSyntax(
+                leadingTrivia: documentation,
+                modifiers: [DeclModifierSyntax(name: .keyword(.final))],
+                name: .name(type),
+                inheritanceClause: .swift("Sendable")
+            ) {
+                for field in fields { VariableDeclSyntax.binding(field.name, field.type) }
+                InitializerDeclSyntax(signature: .of(fields.map { .parameter($0.name, $0.name, $0.type) })) {
+                    for field in fields {
+                        ExprSyntax(MemberAccessExprSyntax(base: DeclReferenceExprSyntax(baseName: .keyword(.self)), declName: DeclReferenceExprSyntax(baseName: .name(field.name))))
+                            .assigned(.named(field.name))
+                    }
+                }
+            })
+            parserMethods.append(sequenceMethod(name: "parse" + type, type: .named(type), items: compiled) { values in
+                ExprSyntax.named(type).call(labeled: zip(fields, values).map { ($0.name, $1) })
+            })
         }
-        lines.append("}")
-        lines.append("")
-        lines.append("extension \(namespace).\(type) {")
-        lines.append("    /// Reads all of `text` as `\(production.symbol)`.")
-        lines.append("    static func parse(_ text: Swift.String) throws(\(namespace).SyntaxError) -> \(namespace).\(type) {")
-        lines.append("        try \(namespace).parse(text) { $0.parse\(type)() }")
-        lines.append("    }")
-        lines.append("}")
-        return lines
+        let parse = ExtensionDeclSyntax(extendedType: qualified(production.symbol)) {
+            FunctionDeclSyntax(
+                leadingTrivia: .documentation("Reads all of `text` as `\(production.symbol)`."),
+                modifiers: .static,
+                name: .name("parse"),
+                signature: .of([.parameter(nil, "text", Self.string)], returning: qualified(production.symbol), throwing: namespaceType.member("SyntaxError"))
+            ) {
+                VariableDeclSyntax.binding("parser", nil, ExprSyntax.named(namespace).dot("Parser").call(.named("text")).tried, mutable: true)
+                IfExprSyntax(conditions: ConditionElementListSyntax {
+                    ConditionElementSyntax.binding("node", ExprSyntax.named("parser").dot("parse" + type).call())
+                    ConditionElementSyntax.expression(ExprSyntax.named("parser").dot("isAtEnd"))
+                }) {
+                    StmtSyntax.return(.named("node"))
+                }
+                StmtSyntax.throw(ExprSyntax.named("parser").dot("failure").call())
+            }
+        }
+        return [DeclSyntax(ExtensionDeclSyntax(extendedType: namespaceType) { declaration }), DeclSyntax(parse)]
+    }
+
+    /// An enum with a case for each of `cases`.
+    static func enumDeclaration(_ name: String, cases: [Case], leadingTrivia: Trivia = []) -> EnumDeclSyntax {
+        EnumDeclSyntax(
+            leadingTrivia: leadingTrivia,
+            modifiers: [DeclModifierSyntax(name: .keyword(.indirect))],
+            name: .name(name),
+            inheritanceClause: .swift("Sendable")
+        ) {
+            for item in cases {
+                EnumCaseDeclSyntax {
+                    EnumCaseElementSyntax(name: .name(item.name), parameterClause: item.compiled.part.map(Self.associatedValues))
+                }
+            }
+        }
+    }
+
+    /// The associated values of a case that holds `part`: one for each of
+    /// its fields when it is a tuple.
+    static func associatedValues(_ part: Part) -> EnumCaseParameterClauseSyntax {
+        EnumCaseParameterClauseSyntax(parameters: EnumCaseParameterListSyntax {
+            if let fields = part.fields {
+                for field in fields {
+                    EnumCaseParameterSyntax(firstName: .name(field.name), colon: .colonToken(), type: field.type)
+                }
+            } else {
+                EnumCaseParameterSyntax(type: part.type)
+            }
+        })
     }
 
     /// Gives parts with the same name distinct names, in order.
@@ -716,26 +1022,26 @@ private struct Translation {
             var part = part
             let count = used[part.name, default: 0] + 1
             used[part.name] = count
-            if count > 1 { part.name = SwiftName.escaped(SwiftName.unescaped(part.name) + String(count)) }
+            if count > 1 { part.name += String(count) }
             return part
         }
     }
 
     mutating func nextMethod() -> String {
         methodCounter += 1
-        return "read\(methodCounter)"
+        return "read" + String(methodCounter)
     }
 
     mutating func compile(_ expression: Expression, owner: String) throws(TranslationError) -> Compiled {
         switch expression {
         case .symbol(let symbol):
             let type = SwiftName.type(symbol)
-            let part = Part(type: "\(namespace).\(type)", name: SwiftName.member(symbol))
-            return Compiled(method: tokenLevel.contains(symbol) ? "parse\(type)" : "take\(type)", part: part)
+            let part = Part(type: qualified(symbol), name: SwiftName.member(symbol))
+            return Compiled(method: (tokenLevel.contains(symbol) ? "parse" : "take") + type, part: part)
         case .string(let text, let quote):
             let literal = Literal(text: text, caseInsensitive: quote == configuration.caseInsensitiveStrings)
             guard let index = literals.firstIndex(of: literal) else { throw TranslationError("internal: string \(text) not collected") }
-            return Compiled(method: "takeLiteral\(index)", part: nil)
+            return Compiled(method: "takeLiteral" + String(index), part: nil)
         case .sequence(let items):
             var compiled: [Compiled] = []
             for item in items { compiled.append(try compile(item, owner: owner)) }
@@ -746,50 +1052,65 @@ private struct Translation {
             case 0: part = nil
             case 1: part = parts[0]
             default:
+                let fields = parts.map { (name: $0.name, type: $0.type) }
                 part = Part(
-                    type: "(" + parts.map { "\($0.name): \($0.type)" }.joined(separator: ", ") + ")",
-                    name: SwiftName.escaped(SwiftName.lowerCamel(SwiftName.compound(parts.map(\.name), separator: "And"))),
-                    fields: parts.map { ($0.name, $0.type) }
+                    type: .tuple(fields),
+                    name: SwiftName.lowerCamel(SwiftName.compound(parts.map(\.name), separator: "And")),
+                    fields: fields
                 )
             }
-            parserMethods.append(contentsOf: sequenceMethod(name: method, type: part?.type ?? "()", items: compiled, fieldNames: parts.map(\.name), construct: { values in
+            parserMethods.append(sequenceMethod(name: method, type: part?.type ?? TypeSyntax(TupleTypeSyntax(elements: [])), items: compiled) { values in
                 switch values.count {
-                case 0: "()"
+                case 0: .void
                 case 1: values[0]
-                default: "(" + zip(parts, values).map { "\($0.name): \($1)" }.joined(separator: ", ") + ")"
+                default: .tuple(zip(parts, values).map { ($0.name, $1) })
                 }
-            }))
+            })
             return Compiled(method: method, part: part)
         case .choice(let options):
             let cases = try compileCases(options, owner: owner)
-            var name = SwiftName.compound(cases.compiled.map(\.name), separator: "Or")
+            var name = SwiftName.compound(cases.map(\.name), separator: "Or")
             if nestedNames[owner, default: []].contains(name) {
                 var index = 2
                 while nestedNames[owner, default: []].contains(name + String(index)) { index += 1 }
                 name += String(index)
             }
             nestedNames[owner, default: []].insert(name)
-            let qualified = "\(namespace).\(owner).\(name)"
-            var declaration = ["", "    indirect enum \(name): Swift.Sendable {"]
-            declaration.append(contentsOf: cases.declarations.map { "        " + $0 })
-            declaration.append("    }")
-            nested[owner, default: []].append(contentsOf: declaration)
+            let qualified = namespaceType.member(owner).member(name)
+            nested[owner, default: []].append(Self.enumDeclaration(name, cases: cases))
             let method = nextMethod()
-            parserMethods.append(contentsOf: choiceMethod(name: method, type: qualified, cases: cases.compiled))
-            return Compiled(method: method, part: Part(type: qualified, name: SwiftName.member(SwiftName.lowerCamel(name))))
+            parserMethods.append(choiceMethod(name: method, type: qualified, options: options, cases: cases))
+            return Compiled(method: method, part: Part(type: qualified, name: SwiftName.lowerCamel(name)))
         case .optional(let item):
             let inner = try compile(item, owner: owner)
             let method = nextMethod()
             let part: Part
-            var body: [String] = ["let start = index"]
+            let start = VariableDeclSyntax.binding("start", nil, .named("index"))
+            let reset = ExprSyntax.named("index").assigned(.named("start"))
+            let call = ExprSyntax.named(inner.method).call()
+            let body: CodeBlockItemListSyntax
             if let innerPart = inner.part {
-                part = Part(type: innerPart.type.hasSuffix("?") ? innerPart.type : "\(innerPart.type)?", name: innerPart.name)
-                body += ["if let value = \(inner.method)() { return .some(value) }", "index = start", "return .some(nil)"]
+                part = Part(type: innerPart.type.is(OptionalTypeSyntax.self) ? innerPart.type : innerPart.type.optional, name: innerPart.name)
+                body = CodeBlockItemListSyntax {
+                    start
+                    IfExprSyntax(conditions: [.binding("value", call)]) {
+                        StmtSyntax.return(ExprSyntax.dot("some").call(.named("value")))
+                    }
+                    reset
+                    StmtSyntax.return(ExprSyntax.dot("some").call(.nil))
+                }
             } else {
-                part = Part(type: "Swift.Bool", name: Self.wordName(item) ?? "isPresent")
-                body += ["if \(inner.method)() != nil { return true }", "index = start", "return false"]
+                part = Part(type: Self.bool, name: Self.wordName(item) ?? "isPresent")
+                body = CodeBlockItemListSyntax {
+                    start
+                    IfExprSyntax(conditions: .expression(call.infix("!=", .nil))) {
+                        StmtSyntax.return(.bool(true))
+                    }
+                    reset
+                    StmtSyntax.return(.bool(false))
+                }
             }
-            parserMethods.append(contentsOf: Self.method(method, returning: part.type, body: body))
+            parserMethods.append(Self.method(method, returning: part.type, body: body))
             return Compiled(method: method, part: part)
         case .zeroOrMore(let item), .oneOrMore(let item):
             let inner = try compile(item, owner: owner)
@@ -797,39 +1118,59 @@ private struct Translation {
             let atLeastOne: Bool
             if case .oneOrMore = expression { atLeastOne = true } else { atLeastOne = false }
             let part: Part
-            var body: [String]
-            if let innerPart = inner.part {
-                part = Part(type: "[\(innerPart.type)]", name: SwiftName.plural(innerPart.name))
-                body = [
-                    "var items: \(part.type) = []",
-                    "while true {",
-                    "    let start = index",
-                    "    guard let item = \(inner.method)() else { index = start; break }",
-                    "    if index == start { break }",
-                    "    items.append(item)",
-                    "}",
-                ]
-                if atLeastOne { body.append("if items.isEmpty { return nil }") }
-                body.append("return items")
-            } else {
-                part = Part(type: "Swift.Int", name: (Self.wordName(item).map(SwiftName.unescaped) ?? "item") + "Count")
-                body = [
-                    "var count = 0",
-                    "while true {",
-                    "    let start = index",
-                    "    guard \(inner.method)() != nil else { index = start; break }",
-                    "    if index == start { break }",
-                    "    count += 1",
-                    "}",
-                ]
-                if atLeastOne { body.append("if count == 0 { return nil }") }
-                body.append("return count")
+            let collected: String
+            let none: ExprSyntax
+            let take: CodeBlockItemListSyntax
+            let call = ExprSyntax.named(inner.method).call()
+            let back = CodeBlockItemListSyntax {
+                ExprSyntax.named("index").assigned(.named("start"))
+                StmtSyntax.break
             }
-            parserMethods.append(contentsOf: Self.method(method, returning: part.type, body: body))
+            if let innerPart = inner.part {
+                part = Part(type: innerPart.type.array, name: SwiftName.plural(innerPart.name))
+                collected = "items"
+                none = ExprSyntax.named("items").dot("isEmpty")
+                take = CodeBlockItemListSyntax {
+                    GuardStmtSyntax(conditions: [.binding("item", call)], body: CodeBlockSyntax(statements: back))
+                    unchangedBreak
+                    ExprSyntax.named("items").dot("append").call(.named("item"))
+                }
+            } else {
+                part = Part(type: Self.int, name: (Self.wordName(item) ?? "item") + "Count")
+                collected = "count"
+                none = ExprSyntax.named("count").infix("==", .int(0))
+                take = CodeBlockItemListSyntax {
+                    GuardStmtSyntax(conditions: .expression(call.infix("!=", .nil)), body: CodeBlockSyntax(statements: back))
+                    unchangedBreak
+                    ExprSyntax.named("count").infix("+=", .int(1))
+                }
+            }
+            let body = CodeBlockItemListSyntax {
+                if inner.part != nil {
+                    VariableDeclSyntax.binding("items", part.type, .array([]), mutable: true)
+                } else {
+                    VariableDeclSyntax.binding("count", nil, .int(0), mutable: true)
+                }
+                WhileStmtSyntax(conditions: .expression(.bool(true))) {
+                    VariableDeclSyntax.binding("start", nil, .named("index"))
+                    take
+                }
+                if atLeastOne {
+                    IfExprSyntax(conditions: .expression(none)) { StmtSyntax.return(.nil) }
+                }
+                StmtSyntax.return(.named(collected))
+            }
+            parserMethods.append(Self.method(method, returning: part.type, body: body))
             return Compiled(method: method, part: part)
         case .character, .characterClass, .difference:
             throw TranslationError("internal: \(expression.notation) is read over terminals")
         }
+    }
+
+    /// `if index == start { break }`: an item that matched nothing ends a
+    /// repetition.
+    var unchangedBreak: IfExprSyntax {
+        IfExprSyntax(conditions: .expression(ExprSyntax.named("index").infix("==", .named("start")))) { StmtSyntax.break }
     }
 
     static func wordName(_ expression: Expression) -> String? {
@@ -842,333 +1183,201 @@ private struct Translation {
         var compiled: Compiled
     }
 
-    mutating func compileCases(_ options: [Expression], owner: String) throws(TranslationError) -> (declarations: [String], compiled: [Case]) {
+    mutating func compileCases(_ options: [Expression], owner: String) throws(TranslationError) -> [Case] {
         var cases: [Case] = []
         var used: Set<String> = []
         for (index, option) in options.enumerated() {
             let compiled = try compile(option, owner: owner)
             // An alternative is named after the first thing it holds.
-            var name = compiled.part?.fields?.first?.name ?? compiled.part?.name ?? Self.wordName(option) ?? "alternative\(index + 1)"
+            var name = compiled.part?.fields?.first?.name ?? compiled.part?.name ?? Self.wordName(option) ?? "alternative" + String(index + 1)
             if used.contains(name) {
                 var suffix = 2
-                while used.contains(SwiftName.escaped(SwiftName.unescaped(name) + String(suffix))) { suffix += 1 }
-                name = SwiftName.escaped(SwiftName.unescaped(name) + String(suffix))
+                while used.contains(name + String(suffix)) { suffix += 1 }
+                name += String(suffix)
             }
             used.insert(name)
             cases.append(Case(name: name, compiled: compiled))
         }
-        let declarations = cases.map { item -> String in
-            guard let part = item.compiled.part else { return "case \(item.name)" }
-            if let fields = part.fields {
-                return "case \(item.name)(" + fields.map { "\($0.name): \($0.type)" }.joined(separator: ", ") + ")"
-            }
-            return "case \(item.name)(\(part.type))"
-        }
-        return (declarations, cases)
+        return cases
     }
 
-    func choiceMethod(name: String, type: String, cases: [Case]) -> [String] {
-        var body = ["let start = index"]
-        for item in cases {
-            if let part = item.compiled.part {
-                if let fields = part.fields {
-                    let arguments = fields.map { "\($0.name): value.\($0.name)" }.joined(separator: ", ")
-                    body.append("if let value = \(item.compiled.method)() { return .\(item.name)(\(arguments)) }")
+    /// The method that reads one of `options`, trying them in the order
+    /// ``Lookahead/order(_:)`` gives.
+    func choiceMethod(name: String, type: TypeSyntax, options: [Expression], cases: [Case]) -> FunctionDeclSyntax {
+        let body = CodeBlockItemListSyntax {
+            VariableDeclSyntax.binding("start", nil, .named("index"))
+            for index in lookahead.order(options) {
+                let item = cases[index]
+                let call = ExprSyntax.named(item.compiled.method).call()
+                if let part = item.compiled.part {
+                    IfExprSyntax(conditions: [.binding("value", call)]) { StmtSyntax.return(Self.caseValue(item.name, holding: part)) }
                 } else {
-                    body.append("if let value = \(item.compiled.method)() { return .\(item.name)(value) }")
+                    IfExprSyntax(conditions: .expression(call.infix("!=", .nil))) { StmtSyntax.return(.dot(item.name)) }
                 }
-            } else {
-                body.append("if \(item.compiled.method)() != nil { return .\(item.name) }")
+                ExprSyntax.named("index").assigned(.named("start"))
             }
-            body.append("index = start")
+            StmtSyntax.return(.nil)
         }
-        body.append("return nil")
         return Self.method(name, returning: type, body: body)
     }
 
-    func sequenceMethod(name: String, type: String, items: [Compiled], fieldNames: [String], construct: ([String]) -> String) -> [String] {
-        var body = ["let start = index"]
-        var values: [String] = []
-        for (index, item) in items.enumerated() {
-            if item.part != nil {
-                body.append("guard let value\(index) = \(item.method)() else { index = start; return nil }")
-                values.append("value\(index)")
-            } else {
-                body.append("guard \(item.method)() != nil else { index = start; return nil }")
-            }
+    /// `.name(value)`, or `.name(a: value.a, b: value.b)` for a tuple.
+    static func caseValue(_ name: String, holding part: Part) -> ExprSyntax {
+        guard let fields = part.fields else { return ExprSyntax.dot(name).call(.named("value")) }
+        return ExprSyntax.dot(name).call(labeled: fields.map { ($0.name, ExprSyntax.named("value").dot($0.name)) })
+    }
+
+    /// The method that reads `items` in order; `construct` makes what it
+    /// returns from the values of the items that hold something.
+    func sequenceMethod(name: String, type: TypeSyntax, items: [Compiled], construct: ([ExprSyntax]) -> ExprSyntax) -> FunctionDeclSyntax {
+        let values = items.indices.filter { items[$0].part != nil }.map { "value" + String($0) }
+        let back = CodeBlockItemListSyntax {
+            ExprSyntax.named("index").assigned(.named("start"))
+            StmtSyntax.return(.nil)
         }
-        body.append("return " + construct(values))
+        let body = CodeBlockItemListSyntax {
+            VariableDeclSyntax.binding("start", nil, .named("index"))
+            for (index, item) in items.enumerated() {
+                let call = ExprSyntax.named(item.method).call()
+                if item.part != nil {
+                    GuardStmtSyntax(conditions: [.binding("value" + String(index), call)], body: CodeBlockSyntax(statements: back))
+                } else {
+                    GuardStmtSyntax(conditions: .expression(call.infix("!=", .nil)), body: CodeBlockSyntax(statements: back))
+                }
+            }
+            StmtSyntax.return(construct(values.map(ExprSyntax.named)))
+        }
         return Self.method(name, returning: type, body: body)
     }
 
-    static func method(_ name: String, returning type: String, body: [String]) -> [String] {
-        ["", "    mutating func \(name)() -> \(type)? {"] + body.map { "        " + $0 } + ["    }"]
+    /// `mutating func name() -> type? { body }`.
+    static func method(_ name: String, returning type: TypeSyntax, body: CodeBlockItemListSyntax) -> FunctionDeclSyntax {
+        FunctionDeclSyntax(
+            modifiers: .mutating,
+            name: .name(name),
+            signature: .of([], returning: type.optional),
+            body: CodeBlockSyntax(statements: body)
+        )
     }
 
-    func parserDeclaration() -> [String] {
-        var lines: [String] = []
-        lines.append("extension \(namespace) {")
-        lines.append("    /// Reads tokens as the productions read over terminals, trying the")
-        lines.append("    /// alternatives of a choice in order.")
-        lines.append("    struct Parser {")
-        lines.append("        let tokens: [Token]")
-        lines.append("        let end: Location")
-        lines.append("        var index = 0")
-        lines.append("        var farthest = 0")
-        lines.append("        var expected: Swift.Set<Swift.String> = []")
-        lines.append("")
-        lines.append("        init(tokens: [Token], end: Location) {")
-        lines.append("            self.tokens = tokens")
-        lines.append("            self.end = end")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        mutating func take(_ kind: Kind) -> Token? {")
-        lines.append("            if index < tokens.count, tokens[index].kind == kind {")
-        lines.append("                index += 1")
-        lines.append("                return tokens[index - 1]")
-        lines.append("            }")
-        lines.append("            expect(Self.describe(kind))")
-        lines.append("            return nil")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        mutating func expect(_ description: Swift.String) {")
-        lines.append("            if index > farthest {")
-        lines.append("                farthest = index")
-        lines.append("                expected = []")
-        lines.append("            }")
-        lines.append("            if index == farthest { expected.insert(description) }")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        mutating func expectEnd() {")
-        lines.append("            expect(\"the end of the document\")")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        func failure() -> SyntaxError {")
-        lines.append("            let found = farthest < tokens.count ? \"'\" + tokens[farthest].text + \"'\" : \"the end of the document\"")
-        lines.append("            let location = farthest < tokens.count ? tokens[farthest].location : end")
-        lines.append("            return SyntaxError(location: location, message: \"expected \" + expected.sorted().joined(separator: \" or \") + \", found \" + found)")
-        lines.append("        }")
-        lines.append("")
-        lines.append("        static func describe(_ kind: Kind) -> Swift.String {")
-        lines.append("            switch kind {")
-        for terminal in lexerTerminals {
-            lines.append("            case .\(SwiftName.type(terminal)): \(Self.stringLiteral(terminal))")
+    // MARK: - The parser
+
+    func parserDeclaration() -> ExtensionDeclSyntax {
+        let token = TypeSyntax.named("Token")
+        let tokens = ExprSyntax.named("tokens")
+        let index = ExprSyntax.named("index")
+        let farthest = ExprSyntax.named("farthest")
+        let endOfDocument = ExprSyntax.string("the end of the document")
+        return ExtensionDeclSyntax(extendedType: namespaceType) {
+            StructDeclSyntax(
+                leadingTrivia: .documentation(
+                    "Reads tokens as the productions read over terminals, trying the",
+                    "alternatives of a choice in turn, those that can match nothing last."
+                ),
+                name: .name("Parser")
+            ) {
+                VariableDeclSyntax.binding("tokens", token.array)
+                VariableDeclSyntax.binding("end", .named("Location"))
+                VariableDeclSyntax.binding("index", nil, .int(0), mutable: true)
+                VariableDeclSyntax.binding("farthest", nil, .int(0), mutable: true)
+                VariableDeclSyntax.binding("expected", TypeSyntax.swift("Set", Self.string), .array([]), mutable: true)
+                InitializerDeclSyntax(
+                    leadingTrivia: .documentation("A parser of the tokens of `text`."),
+                    signature: .of([.parameter(nil, "text", Self.string)], throwing: .named("SyntaxError"))
+                ) {
+                    VariableDeclSyntax.binding("lexed", nil, ExprSyntax.named("Lexer").dot("tokens").call(labeled: [
+                        ("in", ExprSyntax.named("Swift").dot("Array").call(ExprSyntax.named("text").dot("unicodeScalars"))),
+                    ]).tried)
+                    tokens.assigned(ExprSyntax.named("lexed").dot("tokens"))
+                    ExprSyntax.named("end").assigned(ExprSyntax.named("lexed").dot("end"))
+                }
+                VariableDeclSyntax.computed("isAtEnd", Self.bool, leadingTrivia: .documentation("Whether every token has been read.")) {
+                    StmtSyntax.return(index.infix("==", tokens.dot("count")))
+                }
+                FunctionDeclSyntax(modifiers: .mutating, name: .name("take"), signature: .of([.parameter(nil, "kind", .named("Kind"))], returning: token.optional)) {
+                    IfExprSyntax(conditions: ConditionElementListSyntax {
+                        ConditionElementSyntax.expression(index.infix("<", tokens.dot("count")))
+                        ConditionElementSyntax.expression(tokens.subscripted(index).dot("kind").infix("==", .named("kind")))
+                    }) {
+                        index.infix("+=", .int(1))
+                        StmtSyntax.return(tokens.subscripted(index.infix("-", .int(1))))
+                    }
+                    ExprSyntax.named("expect").call(ExprSyntax.selfType.dot("describe").call(.named("kind")))
+                    StmtSyntax.return(.nil)
+                }
+                FunctionDeclSyntax(modifiers: .mutating, name: .name("expect"), signature: .of([.parameter(nil, "description", Self.string)])) {
+                    IfExprSyntax(conditions: .expression(index.infix(">", farthest))) {
+                        farthest.assigned(index)
+                        ExprSyntax.named("expected").assigned(.array([]))
+                    }
+                    IfExprSyntax(conditions: .expression(index.infix("==", farthest))) {
+                        ExprSyntax.named("expected").dot("insert").call(.named("description"))
+                    }
+                }
+                FunctionDeclSyntax(
+                    leadingTrivia: .documentation("The error at the farthest token read, which the end of the document can also be expected at."),
+                    modifiers: .mutating,
+                    name: .name("failure"),
+                    signature: .of([], returning: .named("SyntaxError"))
+                ) {
+                    ExprSyntax.named("expect").call(endOfDocument)
+                    let within = farthest.infix("<", tokens.dot("count"))
+                    VariableDeclSyntax.binding("found", nil, ExprSyntax.string("'").infix("+", tokens.subscripted(farthest).dot("text")).infix("+", .string("'")).when(within, else: endOfDocument))
+                    VariableDeclSyntax.binding("location", nil, tokens.subscripted(farthest).dot("location").when(within, else: .named("end")))
+                    StmtSyntax.return(ExprSyntax.named("SyntaxError").call(labeled: [
+                        ("location", .named("location")),
+                        ("message", ExprSyntax.string("expected ")
+                            .infix("+", ExprSyntax.named("expected").dot("sorted").call().dot("joined").call(labeled: [("separator", .string(" or "))]))
+                            .infix("+", .string(", found "))
+                            .infix("+", .named("found"))),
+                    ]))
+                }
+                FunctionDeclSyntax(modifiers: .static, name: .name("describe"), signature: .of([.parameter(nil, "kind", .named("Kind"))], returning: Self.string)) {
+                    SwitchExprSyntax(subject: ExprSyntax.named("kind")) {
+                        for terminal in lexerTerminals {
+                            SwitchCaseSyntax.matching([.dot(SwiftName.type(terminal))]) { StmtSyntax.return(.string(terminal)) }
+                        }
+                        SwitchCaseSyntax.matching([ExprSyntax.dot("literal").call(ExprSyntax(PatternExprSyntax(pattern: ValueBindingPatternSyntax(
+                            bindingSpecifier: .keyword(.let),
+                            pattern: IdentifierPatternSyntax(identifier: .name("index"))
+                        ))))]) {
+                            StmtSyntax.return(ExprSyntax.string("'").infix("+", ExprSyntax.named("Lexer").dot("literals").subscripted(index)).infix("+", .string("'")))
+                        }
+                    }
+                }
+                for terminal in lexerTerminals {
+                    let type = SwiftName.type(terminal)
+                    FunctionDeclSyntax(modifiers: .mutating, name: .name("take" + type), signature: .of([], returning: TypeSyntax.named(type).optional)) {
+                        GuardStmtSyntax(conditions: [.binding("token", ExprSyntax.named("take").call(.dot(type)))]) {
+                            StmtSyntax.return(.nil)
+                        }
+                        StmtSyntax.return(ExprSyntax.named(type).call(labeled: [
+                            ("text", ExprSyntax.named("token").dot("text")),
+                            ("location", ExprSyntax.named("token").dot("location")),
+                        ]))
+                    }
+                }
+                for (literalIndex, literal) in literals.enumerated() {
+                    FunctionDeclSyntax(
+                        leadingTrivia: .documentation("`'\(literal.text)'`"),
+                        modifiers: .mutating,
+                        name: .name("takeLiteral" + String(literalIndex)),
+                        signature: .of([], returning: token.optional)
+                    ) {
+                        StmtSyntax.return(ExprSyntax.named("take").call(ExprSyntax.dot("literal").call(.int(literalIndex))))
+                    }
+                }
+                for method in parserMethods { method }
+            }
         }
-        lines.append("            case .literal(let index): \"'\" + Lexer.literals[index].text + \"'\"")
-        lines.append("            }")
-        lines.append("        }")
-        for terminal in lexerTerminals {
-            let type = SwiftName.type(terminal)
-            lines.append("")
-            lines.append("        mutating func take\(type)() -> \(type)? {")
-            lines.append("            take(.\(type)).map { \(type)(text: $0.text, location: $0.location) }")
-            lines.append("        }")
-        }
-        for (index, literal) in literals.enumerated() {
-            lines.append("")
-            lines.append("        /// \(Self.stringLiteral(literal.text))")
-            lines.append("        mutating func takeLiteral\(index)() -> ()? {")
-            lines.append("            take(.literal(\(index))).map { _ in () }")
-            lines.append("        }")
-        }
-        lines.append(contentsOf: parserMethods.map { $0.isEmpty ? $0 : "    " + $0 })
-        lines.append("    }")
-        lines.append("}")
-        return lines
     }
 }
 
-/// Writes the body of a function that matches an expression over
-/// characters: each expression turns the positions that reach its start
-/// into the positions that reach its end.
-///
-/// In ``Mode/ends`` the positions are offsets. In ``Mode/steps`` they are
-/// steps, which also record where each production the expression refers to
-/// matched; the productions it refers to are matched for their ends only.
-private struct MatcherEmitter {
-    enum Mode {
-        case ends
-        case steps
-    }
-
-    let bySymbol: [String: Production]
-    let firstCharacters: [String: FirstCharacters]
-    var classes: [CharacterClass] = []
-    /// The strings of more than one character the expression matches.
-    var strings: [[UInt32]] = []
-    var lines: [String] = []
-    var counter = 0
-
-    init(bySymbol: [String: Production], firstCharacters: [String: FirstCharacters]) {
-        self.bySymbol = bySymbol
-        self.firstCharacters = firstCharacters
-    }
-
-    mutating func function(for expression: Expression, mode: Mode) throws(TranslationError) -> [String] {
-        lines = [mode == .ends ? "let start: [Swift.Int] = [offset]" : "let start: [Step] = [Step(end: offset, trace: nil)]"]
-        let result = try emit(expression, from: "start", mode: mode, indent: 0)
-        lines.append("return \(result)")
-        return lines
-    }
-
-    mutating func fresh(_ prefix: String = "positions") -> String {
-        counter += 1
-        return "\(prefix)\(counter)"
-    }
-
-    mutating func line(_ text: String, _ indent: Int) {
-        lines.append(String(repeating: "    ", count: indent) + text)
-    }
-
-    func type(_ mode: Mode) -> String {
-        mode == .ends ? "[Swift.Int]" : "[Step]"
-    }
-
-    /// `position` advanced by `count` characters, in `mode`.
-    func advanced(_ position: String, by count: String, _ mode: Mode) -> String {
-        mode == .ends ? "\(position) + \(count)" : "Step(end: \(position).end + \(count), trace: \(position).trace)"
-    }
-
-    func end(_ position: String, _ mode: Mode) -> String {
-        mode == .ends ? position : "\(position).end"
-    }
-
-    func unique(_ mode: Mode) -> String {
-        mode == .ends ? "Step.uniqueEnds" : "Step.unique"
-    }
-
-    /// Writes the positions after `expression` from the positions in
-    /// `input`, and returns the variable that holds them.
-    mutating func emit(_ expression: Expression, from input: String, mode: Mode, indent: Int) throws(TranslationError) -> String {
-        switch expression {
-        case .symbol(let symbol):
-            guard bySymbol[symbol] != nil else { throw TranslationError("'\(symbol)' is used but not defined") }
-            let type = SwiftName.type(symbol)
-            let output = fresh()
-            let at = end("position", mode)
-            line("var \(output): \(self.type(mode)) = []", indent)
-            if firstCharacters[symbol]?.mustAlwaysTry == false {
-                line("for position in \(input) where \(at) < s.count && \(type).starts(s[\(at)].value) {", indent)
-            } else {
-                line("for position in \(input) {", indent)
-            }
-            switch mode {
-            case .ends:
-                line("    \(output) += \(type).ends(s, position)", indent)
-            case .steps:
-                line("    for end in \(type).ends(s, position.end) {", indent)
-                line("        \(output).append(Step(end: end, trace: Trace(.\(type), position.end, end, position.trace)))", indent)
-                line("    }", indent)
-            }
-            line("}", indent)
-            line("\(output) = \(unique(mode))(\(output))", indent)
-            return output
-        case .string(let text, _):
-            let scalars = text.unicodeScalars.map(\.value)
-            let output = fresh()
-            let at = end("position", mode)
-            line("var \(output): \(type(mode)) = []", indent)
-            if scalars.count == 1 {
-                line("for position in \(input) where \(at) < s.count && s[\(at)].value == \(Translation.hex(scalars[0])) {", indent)
-            } else {
-                if !strings.contains(scalars) { strings.append(scalars) }
-                line("for position in \(input) where Step.has(s, \(at), string\(strings.firstIndex(of: scalars)!)) {", indent)
-            }
-            line("    \(output).append(\(advanced("position", by: String(scalars.count), mode)))", indent)
-            line("}", indent)
-            return output
-        case .character(let value):
-            let output = fresh()
-            let at = end("position", mode)
-            line("var \(output): \(type(mode)) = []", indent)
-            line("for position in \(input) where \(at) < s.count && s[\(at)].value == \(Translation.hex(value)) {", indent)
-            line("    \(output).append(\(advanced("position", by: "1", mode)))", indent)
-            line("}", indent)
-            return output
-        case .characterClass(let characterClass):
-            let index: Int
-            if let existing = classes.firstIndex(of: characterClass) {
-                index = existing
-            } else {
-                classes.append(characterClass)
-                index = classes.count - 1
-            }
-            let output = fresh()
-            let at = end("position", mode)
-            line("var \(output): \(type(mode)) = []", indent)
-            line("for position in \(input) where \(at) < s.count && class\(index)(s[\(at)].value) {", indent)
-            line("    \(output).append(\(advanced("position", by: "1", mode)))", indent)
-            line("}", indent)
-            return output
-        case .sequence(let items):
-            var current = input
-            for item in items {
-                current = try emit(item, from: current, mode: mode, indent: indent)
-            }
-            return current
-        case .choice(let options):
-            var outputs: [String] = []
-            for option in options {
-                outputs.append(try emit(option, from: input, mode: mode, indent: indent))
-            }
-            let output = fresh()
-            line("var \(output) = \(outputs[0])", indent)
-            for other in outputs.dropFirst() {
-                line("\(output) += \(other)", indent)
-            }
-            line("\(output) = \(unique(mode))(\(output))", indent)
-            return output
-        case .optional(let item):
-            let inner = try emit(item, from: input, mode: mode, indent: indent)
-            let output = fresh()
-            line("let \(output) = \(unique(mode))(\(input) + \(inner))", indent)
-            return output
-        case .zeroOrMore(let item):
-            return try repetition(item, from: input, mode: mode, indent: indent)
-        case .oneOrMore(let item):
-            let first = try emit(item, from: input, mode: mode, indent: indent)
-            return try repetition(item, from: first, mode: mode, indent: indent)
-        case .difference(let left, let right):
-            let output = fresh()
-            let position = fresh("position")
-            line("var \(output): \(type(mode)) = []", indent)
-            line("for \(position) in \(input) {", indent)
-            let leftInput = fresh()
-            line("    let \(leftInput) = [\(position)]", indent)
-            let leftOutput = try emit(left, from: leftInput, mode: mode, indent: indent + 1)
-            // B only needs to match as far as A reaches: it reads the
-            // characters up to the end of A's longest match.
-            let excluded = fresh("excluded")
-            let leftEnds = mode == .ends ? leftOutput : "\(leftOutput).map(\\.end)"
-            line("    let \(excluded): Swift.Set<Swift.Int> = {", indent)
-            line("        let s = Swift.Array(s[..<(\(leftEnds).max() ?? \(end(position, mode)))])", indent)
-            let rightInput = fresh()
-            line("        let \(rightInput) = [\(end(position, mode))]", indent)
-            let rightOutput = try emit(right, from: rightInput, mode: .ends, indent: indent + 2)
-            line("        return Swift.Set(\(rightOutput))", indent)
-            line("    }()", indent)
-            line("    \(output) += \(leftOutput).filter { !\(excluded).contains(\(end("$0", mode))) }", indent)
-            line("}", indent)
-            return output
-        }
-    }
-
-    /// `item*` from the positions in `input`: each round takes the
-    /// positions that reach a new end.
-    mutating func repetition(_ item: Expression, from input: String, mode: Mode, indent: Int) throws(TranslationError) -> String {
-        let output = fresh()
-        let frontier = fresh("frontier")
-        let ends = fresh("ends")
-        line("var \(output) = \(input)", indent)
-        line("var \(frontier) = \(input)", indent)
-        line("var \(ends) = Swift.Set(\(mode == .ends ? input : "\(input).map(\\.end)"))", indent)
-        line("while !\(frontier).isEmpty {", indent)
-        let round = fresh()
-        line("    let \(round) = \(frontier)", indent)
-        let inner = try emit(item, from: round, mode: mode, indent: indent + 1)
-        line("    \(frontier) = \(inner).filter { \(ends).insert(\(end("$0", mode))).inserted }", indent)
-        line("    \(output) += \(frontier)", indent)
-        line("}", indent)
-        return output
+extension ExprSyntax {
+    /// `Self<argument>`, a generic type used as a value: `Swift.Set<Swift.Int>`.
+    fileprivate func subscriptedType(_ argument: TypeSyntax) -> ExprSyntax {
+        ExprSyntax(GenericSpecializationExprSyntax(expression: self, genericArgumentClause: GenericArgumentClauseSyntax {
+            GenericArgumentSyntax(argument: .type(argument))
+        }))
     }
 }

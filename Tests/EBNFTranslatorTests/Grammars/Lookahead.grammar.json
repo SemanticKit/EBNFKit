@@ -1,0 +1,11 @@
+{
+  "name": "Lookahead",
+  "documents": [
+    {
+      "file": "lookahead.ebnf",
+      "url": "https://github.com/SemanticKit/EBNFKit/blob/main/Tests/EBNFTranslatorTests/Grammars/lookahead.ebnf",
+      "retrieved": "2026-10-30",
+      "sha256": "05a76b42d520057ddaa6af69d4e93112770ac24985073874fb9130e218d73013"
+    }
+  ]
+}
