@@ -1,0 +1,12 @@
+{
+  "name": "Turtle",
+  "documents": [
+    {
+      "file": "turtle.bnf",
+      "url": "https://www.w3.org/TR/2026/WD-rdf12-turtle-20261023/turtle.bnf",
+      "retrieved": "2026-10-30",
+      "sha256": "f41c7cca08fd25ab2bdfa7edce8bb638f362c44599320d3f4ae9205c454e1d16"
+    }
+  ],
+  "caseInsensitiveStrings": "quotationMark"
+}
