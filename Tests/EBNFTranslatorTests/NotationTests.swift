@@ -43,6 +43,26 @@ import Testing
         }
     }
 
+    /// The grammars of XML 1.0, Namespaces in XML 1.0, XPath 2.0 and 3.0
+    /// and XQuery 1.0, as extracted from the Recommendations
+    /// (`Grammars/Notation`), read and written back.
+    ///
+    /// The extraction of the XPath and XQuery grammars follows their
+    /// productions with a line `<?TOKENS?>` and terminals that link to the
+    /// productions of other Recommendations
+    /// (`[http://www.w3.org/TR/REC-xml#NT-Char]`). Both are the extraction
+    /// tool's, not the notation's, so only the productions before the line
+    /// are read.
+    @Test(arguments: ["xml", "xml-names", "xpath20", "xpath30", "xquery10"])
+    func writesWhatItReadsOfAW3CGrammar(file: String) throws {
+        let text = try String(contentsOf: Self.grammars.appending(path: "Notation/\(file).ebnf"), encoding: .utf8)
+        let productions = text.components(separatedBy: "\n<?TOKENS?>\n")[0]
+        let grammar = try Grammar(notation: productions)
+        #expect(grammar.productions.count > 20)
+        let written = grammar.productions.map { "\($0.symbol) ::= \($0.expression.notation)" }.joined(separator: "\n")
+        #expect(try Grammar(notation: written) == grammar)
+    }
+
     @Test func readsTheScrapsOfTheXMLRecommendations() throws {
         let grammar = try Self.configuration("XMLNames").grammar(in: Self.grammars)
         #expect(grammar["NCName"]?.expression == .difference(

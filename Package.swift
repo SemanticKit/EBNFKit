@@ -41,12 +41,7 @@ let package = Package(
             dependencies: ["EBNFTranslator"]
         ),
 
-        .testTarget(
-            name: "EBNFKitTests",
-            dependencies: ["EBNFKit"],
-            resources: [.copy("Data")]
-        ),
-        // The W3C RDF 1.2 grammars as published, translated by the plugin,
+        // W3C grammars as published, translated by the plugin or read back,
         // and the parsers the translation gives.
         .testTarget(
             name: "EBNFTranslatorTests",
