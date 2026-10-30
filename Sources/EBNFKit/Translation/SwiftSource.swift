@@ -8,7 +8,10 @@
 /// - Each terminal production (one after `@terminals`, or every production
 ///   of a grammar without that line) becomes a struct holding the text it
 ///   matched and where the text starts. Its static `matches(_:)` and
-///   `longestMatch(in:at:)` match the production over characters, its
+///   `longestMatch(in:at:)` match the production over characters, with the
+///   minimal deterministic automaton of its expression when the expression
+///   is regular (``Automaton``) and by following every position the
+///   expression can reach when it refers back to itself; its
 ///   `init?(parsing:)` reads a whole string as the production, and it has a
 ///   member for each production its expression refers to, holding the
 ///   parts of its text those productions matched.
